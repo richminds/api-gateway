@@ -1,6 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "env": {
+    "GATEWAY_ROUTES": "auth:/auth:https://auth-service-zhx8.vercel.app/auth,llm:/api/llm:https://llm-gateway-theta.vercel.app,knowledge:/api/knowledge:https://knowledge-service-topaz.vercel.app",
+    "GATEWAY_PUBLIC_PATHS": "POST:/auth/login,POST:/auth/register,POST:/auth/organizations/register",
+    "GATEWAY_LOGOUT_PATHS": "/auth/logout",
+    "GATEWAY_JWT_ISSUER": "auth-service",
+    "GATEWAY_JWT_AUDIENCE": "llm-gateway",
     "APIGW_CORS_ORIGIN_REGEX": "^https://(account-management|knowledge-ingest-ui)[a-z0-9-]*\\.vercel\\.app$"
   }
 }

@@ -65,12 +65,15 @@ def _warn_on_insecure_config() -> None:
     """
     complain = logger.error if service_settings.is_production else logger.warning
 
-    if gateway_settings.jwt_secret_is_default:
+    if gateway_settings.jwt_secret_is_insecure:
+        blank = not gateway_settings.jwt_secret.strip()
         complain(
-            "GATEWAY_JWT_SECRET is unset — using the built-in development "
-            "default. Anyone who has read this source can forge a valid token "
-            "for any user. Set it to the same value as AUTH_JWT_SECRET before "
-            "exposing this gateway."
+            "GATEWAY_JWT_SECRET is %s. Anyone who has read this source can "
+            "forge a valid token for any user, and tokens from a properly "
+            "configured auth-service will be rejected — every request 401s "
+            "with reason 'invalid_token'. Set it to the same value as "
+            "auth-service's AUTH_JWT_SECRET.",
+            "EMPTY" if blank else "unset — using the built-in development default",
         )
 
     if not gateway_settings.auth_enabled:

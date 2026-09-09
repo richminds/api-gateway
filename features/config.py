@@ -200,6 +200,20 @@ class GatewaySettings(BaseSettings):
     def jwt_secret_is_default(self) -> bool:
         return self.jwt_secret == DEFAULT_JWT_SECRET
 
+    @property
+    def jwt_secret_is_insecure(self) -> bool:
+        """True when the signing key is the built-in default OR blank.
+
+        The blank case is the one worth spelling out. ``GATEWAY_JWT_SECRET=``
+        with nothing after it is what a half-filled .env looks like, and it is
+        NOT the default value — so a check that only compared against the
+        default would wave it through. An empty HMAC key still signs and
+        verifies, so the failure is silent in both directions: against a real
+        auth-service every request 401s for no visible reason, and against
+        another blank-keyed service everything "works" with no security at all.
+        """
+        return self.jwt_secret_is_default or not self.jwt_secret.strip()
+
     def parsed_logout_paths(self) -> frozenset[str]:
         """Normalised set of session-ending paths (no trailing slashes)."""
         return frozenset(
