@@ -83,7 +83,7 @@ def test_verified_identity_is_injected_as_headers(client, user_token):
     assert headers["x-user-id"] == "user-1"
     assert headers["x-user-email"] == "user@example.com"
     assert headers["x-account-id"] == "acme"
-    assert headers["x-org-id"] == "org-1"
+    assert headers["x-account-id"] == "acme"
     assert headers["x-authenticated-via"] == "api-gateway"
 
 
@@ -95,15 +95,15 @@ def test_bearer_token_is_forwarded_too(client, user_token):
     assert seen(response)["headers"]["authorization"] == f"Bearer {user_token}"
 
 
-def test_portless_flag_is_only_sent_when_true(client, fake_auth):
-    register_token(fake_auth, "tok-ordinary", user_id="u1", is_portless=False)
-    register_token(fake_auth, "tok-staff", user_id="u2", is_portless=True)
+def test_admin_flag_is_only_sent_when_true(client, fake_auth):
+    register_token(fake_auth, "tok-ordinary", user_id="u1", is_admin=False)
+    register_token(fake_auth, "tok-admin", user_id="u2", is_admin=True)
 
     ordinary = client.get("/api/llm/v1/models", headers=auth_headers("tok-ordinary"))
-    assert "x-is-portless" not in seen(ordinary)["headers"]
+    assert "x-is-admin" not in seen(ordinary)["headers"]
 
-    staff = client.get("/api/llm/v1/models", headers=auth_headers("tok-staff"))
-    assert seen(staff)["headers"]["x-is-portless"] == "true"
+    admin = client.get("/api/llm/v1/models", headers=auth_headers("tok-admin"))
+    assert seen(admin)["headers"]["x-is-admin"] == "true"
 
 
 def test_correlation_id_is_forwarded(client, user_token):
@@ -129,7 +129,7 @@ def test_a_correlation_id_is_minted_when_absent(client, user_token):
     "header,spoofed",
     [
         ("X-User-ID", "someone-else"),
-        ("X-Org-ID", "another-tenant"),
+        ("X-Account-ID", "another-account-x"),
         ("X-Account-ID", "another-account"),
         ("X-User-Email", "admin@evil.test"),
         ("X-Is-Portless", "true"),
@@ -152,12 +152,12 @@ def test_spoofed_identity_is_replaced_with_the_real_one(client, user_token):
         headers={
             **auth_headers(user_token),
             "X-User-ID": "someone-else",
-            "X-Org-ID": "another-tenant",
+            "X-Account-ID": "another-account",
         },
     )
     headers = seen(response)["headers"]
     assert headers["x-user-id"] == "user-1"
-    assert headers["x-org-id"] == "org-1"
+    assert headers["x-account-id"] == "acme"
 
 
 def test_forwarded_for_is_not_taken_from_the_caller(client, user_token):

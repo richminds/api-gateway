@@ -11,11 +11,15 @@ generation and then receive everything at once.
 
 **2. Replace the caller's identity claims with verified ones.** Every header
 in ``STRIPPED_REQUEST_HEADERS`` is deleted from the incoming request and then
-re-set from the token the gateway verified. This is what makes the whole
-architecture sound: downstream services trust ``X-User-ID`` and ``X-Org-ID``,
-so if a caller could send those headers themselves they would be able to read
-any tenant's data by typing a different value. Stripping is unconditional —
-not "if absent, add", but "remove whatever was there, then set ours".
+re-set from what auth-service said. This is what makes the whole architecture
+sound: downstream services trust ``X-User-ID`` and ``X-Account-ID``, so if a
+caller could send those headers themselves they would be able to read any
+account's data by typing a different value. Stripping is unconditional — not
+"if absent, add", but "remove whatever was there, then set ours".
+
+``x-org-id`` and ``x-is-portless`` are still stripped even though nothing
+sends them any more: a caller must not be able to smuggle in a header that a
+service which has not yet been updated might still honour.
 
 Hop-by-hop headers (RFC 7230 §6.1) are dropped in both directions. Forwarding
 ``Connection``, ``Keep-Alive`` or ``Transfer-Encoding`` from one connection
@@ -64,6 +68,7 @@ STRIPPED_REQUEST_HEADERS = frozenset(
         "x-account-id",
         "x-org-id",
         "x-is-portless",
+        "x-is-admin",
         "x-authenticated-via",
         "x-forwarded-for",
         "x-forwarded-proto",
@@ -126,13 +131,11 @@ def build_upstream_headers(
             headers["x-user-name"] = identity.name
         if identity.account_id:
             headers["x-account-id"] = identity.account_id
-        if identity.org_id:
-            headers["x-org-id"] = identity.org_id
-        if identity.is_portless:
-            # Only ever sent when true. An "X-Is-Portless: false" header invites
-            # a downstream service to parse the string, and "false" is truthy in
+        if identity.is_admin:
+            # Only ever sent when true. An "X-Is-Admin: false" header invites a
+            # downstream service to parse the string, and "false" is truthy in
             # more languages than not.
-            headers["x-is-portless"] = "true"
+            headers["x-is-admin"] = "true"
         if token:
             headers["authorization"] = f"Bearer {token}"
 

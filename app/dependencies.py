@@ -46,16 +46,15 @@ def get_token(request: Request) -> str:
 
 
 def require_admin(identity: CallerIdentity = Depends(get_identity)) -> CallerIdentity:
-    """403s unless the caller is platform staff.
+    """403s unless the caller is an administrator.
 
     The gateway's own administrative routes (usage, rate-limit windows,
-    resolved config) expose every tenant's traffic volumes, so they are gated
-    on the same platform-staff flag knowledge-service uses to bypass per-org
-    filtering. The claim comes from the token and therefore from auth-service —
+    resolved config) expose every account's traffic volumes, so they are gated
+    on membership of the admin app account. The flag comes from auth-service —
     the gateway has no user store of its own to consult.
     """
-    if not identity.is_portless:
+    if not identity.is_admin:
         raise AuthorizationError(
-            "This endpoint is restricted to platform staff."
+            "This endpoint is restricted to administrators."
         )
     return identity

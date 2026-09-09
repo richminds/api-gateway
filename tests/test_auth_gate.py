@@ -148,20 +148,20 @@ def test_the_identity_is_built_from_auth_services_answer(client, user_token):
     response = client.get("/api/llm/v1/models", headers=auth_headers(user_token))
     headers = response.json()["seen"]["headers"]
     assert headers["x-user-id"] == "user-1"
-    assert headers["x-org-id"] == "org-1"
     assert headers["x-account-id"] == "acme"
+    assert headers["x-user-email"] == "user@example.com"
 
 
 def test_a_changed_profile_is_picked_up_without_a_new_token(client, user_token, fake_auth):
-    """The advantage of asking: an admin moving a user to another organization
-    takes effect on the next validation, not when their token expires."""
+    """The advantage of asking: an admin moving a user to another account takes
+    effect on the next validation, not when their token expires."""
     first = client.get("/api/llm/v1/models", headers=auth_headers(user_token))
-    assert first.json()["seen"]["headers"]["x-org-id"] == "org-1"
+    assert first.json()["seen"]["headers"]["x-account-id"] == "acme"
 
-    fake_auth.profiles[user_token] = {**fake_auth.profiles[user_token], "org_id": "org-2"}
+    fake_auth.profiles[user_token] = {**fake_auth.profiles[user_token], "account_id": "globex"}
 
     second = client.get("/api/llm/v1/models", headers=auth_headers(user_token))
-    assert second.json()["seen"]["headers"]["x-org-id"] == "org-2"
+    assert second.json()["seen"]["headers"]["x-account-id"] == "globex"
 
 
 def test_a_200_with_no_user_id_is_not_treated_as_authenticated(client, fake_auth):

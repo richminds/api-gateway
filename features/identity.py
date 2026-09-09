@@ -33,20 +33,18 @@ class CallerIdentity:
     name: str = ""
 
     account_id: str = ""
-    """The application (app account) this session is scoped to. The key for
-    per-account rate limiting and usage. Empty when the user belongs to no app
-    account, which is normal."""
+    """The account this session is scoped to, and the user's only scope —
+    downstream services filter their data on it. Also the key for per-account
+    rate limiting and usage. Empty when the user belongs to no account yet,
+    which is normal."""
 
-    org_id: str = ""
-    """The tenant the user belongs to. Downstream services filter their data on
-    this, so it must come from auth-service and nowhere else."""
-
-    is_portless: bool = False
-    """Platform staff. knowledge-service reads this to bypass per-org
-    filtering, and the gateway's own /v1 admin routes gate on it."""
+    account_ids: list[str] = field(default_factory=list)
+    """Every account this user may sign in through. Informational here — the
+    gateway scopes on ``account_id``, the one this session is actually for."""
 
     is_admin: bool = False
-    """Member of the configured admin app account, per auth-service."""
+    """Member of the configured admin app account, per auth-service. The gate
+    on the gateway's own /v1 administrative routes."""
 
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
     """auth-service's full response, for anything not promoted to a field
@@ -79,18 +77,17 @@ def identity_from_profile(profile: dict[str, Any]) -> CallerIdentity:
     """Build a CallerIdentity from auth-service's ``GET /auth/me`` body.
 
     Tolerant of fields it does not know about, and of nulls: auth-service
-    returns ``account_id``/``org_id`` as ``null`` for a user who has neither,
-    and JSON null must become "" rather than the string "None" — which is what
-    a bare ``str()`` would produce, and which would then be injected downstream
-    as a real-looking tenant.
+    returns ``account_id`` as ``null`` for a user who belongs to no account
+    yet, and JSON null must become "" rather than the string "None" — which is
+    what a bare ``str()`` would produce, and which would then be injected
+    downstream as a real-looking account.
     """
     return CallerIdentity(
         user_id=str(profile.get("user_id") or ""),
         email=str(profile.get("email") or ""),
         name=str(profile.get("name") or ""),
         account_id=str(profile.get("account_id") or ""),
-        org_id=str(profile.get("org_id") or ""),
-        is_portless=bool(profile.get("is_portless", False)),
+        account_ids=[str(a) for a in (profile.get("account_ids") or [])],
         is_admin=bool(profile.get("is_admin", False)),
         raw=profile,
     )

@@ -60,8 +60,7 @@ PROFILES: dict[str, dict] = {
         "email": "user@example.com",
         "name": "Test User",
         "account_id": "acme",
-        "org_id": "org-1",
-        "is_portless": False,
+        "account_ids": ["acme"],
         "is_admin": False,
     },
     STAFF_TOKEN: {
@@ -69,8 +68,7 @@ PROFILES: dict[str, dict] = {
         "email": "staff@portless.io",
         "name": "Staff",
         "account_id": "acme",
-        "org_id": "org-1",
-        "is_portless": True,
+        "account_ids": ["acme"],
         "is_admin": True,
     },
 }
@@ -93,8 +91,7 @@ def register_token(
     email: str = "",
     name: str = "",
     account_id: str = "",
-    org_id: str = "",
-    is_portless: bool = False,
+    account_ids: list[str] | None = None,
     is_admin: bool = False,
 ) -> str:
     """Teach the fake auth-service about an opaque token; return the token.
@@ -108,8 +105,7 @@ def register_token(
         "email": email,
         "name": name,
         "account_id": account_id,
-        "org_id": org_id,
-        "is_portless": is_portless,
+        "account_ids": account_ids if account_ids is not None else ([account_id] if account_id else []),
         "is_admin": is_admin,
     }
     return token
@@ -258,5 +254,5 @@ def user_token() -> str:
 
 @pytest.fixture
 def staff_token() -> str:
-    """Platform staff — what the gateway's own /v1 admin routes require."""
+    """An administrator — what the gateway's own /v1 admin routes require."""
     return STAFF_TOKEN

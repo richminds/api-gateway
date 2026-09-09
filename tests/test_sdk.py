@@ -25,7 +25,7 @@ def login_body(token: str = "token-1") -> dict:
     return {
         "access_token": token,
         "token_type": "bearer",
-        "user": {"user_id": "u1", "email": "u@example.com", "org_id": "org-1"},
+        "user": {"user_id": "u1", "email": "u@example.com", "account_id": "acme"},
         "account_id": "acme",
         "accounts": [{"account_id": "acme", "name": "Acme"}],
     }

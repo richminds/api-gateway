@@ -32,9 +32,9 @@ def introspector(fake: FakeAuthService, **kwargs) -> TokenIntrospector:
 async def test_a_valid_token_returns_the_identity(fake_auth):
     identity = await introspector(fake_auth).validate(VALID_TOKEN)
     assert identity.user_id == "user-1"
-    assert identity.org_id == "org-1"
     assert identity.account_id == "acme"
-    assert identity.is_portless is False
+    assert identity.account_ids == ["acme"]
+    assert identity.is_admin is False
 
 
 async def test_a_rejected_token_raises_with_auth_services_wording(fake_auth):
@@ -50,17 +50,13 @@ async def test_an_empty_token_is_not_sent_to_auth_service(fake_auth):
 
 
 async def test_nulls_become_empty_strings_not_the_word_none(fake_auth):
-    """auth-service returns null for a user with no account or org. A bare
+    """auth-service returns null for a user who belongs to no account. A bare
     str() would produce "None", which would then be injected downstream as a
-    real-looking tenant."""
-    fake_auth.profiles["lonely"] = {
-        "user_id": "u9",
-        "account_id": None,
-        "org_id": None,
-    }
+    real-looking account."""
+    fake_auth.profiles["lonely"] = {"user_id": "u9", "account_id": None}
     identity = await introspector(fake_auth).validate("lonely")
     assert identity.account_id == ""
-    assert identity.org_id == ""
+    assert identity.account_ids == []
 
 
 # ---------------------------------------------------------------------------
