@@ -1,4 +1,4 @@
-"""Gateway domain configuration — upstreams, JWT, budgets, storage.
+"""Gateway domain configuration — upstreams, validation, budgets, storage.
 
 Env vars are prefixed ``GATEWAY_``. This module — and only this module — owns
 *what the gateway fronts and what it trusts*; ``app/config.py`` (prefix
@@ -9,13 +9,10 @@ knowledge-service ``rag/config.py`` (``RAG_``) vs ``app/config.py``
 (``KNOWLEDGE_``), auth-service ``features/config.py`` (``AUTH_``) vs
 ``app/config.py`` (``AUTHSVC_``).
 
-The JWT settings here are not this service's own — they are auth-service's,
-mirrored. auth-service is the trust root for identity: it signs, the gateway
-verifies. HS256 is symmetric, so ``GATEWAY_JWT_SECRET`` must equal
-``AUTH_JWT_SECRET``, ``GATEWAY_JWT_ISSUER`` must equal ``AUTH_JWT_ISSUER``,
-and ``GATEWAY_JWT_AUDIENCE`` must be one of the audiences auth-service mints
-into ``aud``. Get any of those wrong and every request 401s with a signature
-or claim error — see the README's "token lifecycle" section.
+The gateway holds no signing key and knows nothing about token format. It
+validates by asking auth-service (``features/introspection.py``), which owns
+the secret, the algorithm, the expiry rules and the revocation list. The only
+thing configured here is where to ask and how long to trust the answer.
 """
 from __future__ import annotations
 
@@ -28,13 +25,6 @@ logger = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).parent.parent
 
-DEFAULT_JWT_SECRET = "dev-secret-change-me"
-"""Matches auth-service's own development default, so a laptop that has
-neither service configured still produces tokens the gateway accepts. It is
-worthless as a secret — anyone who has read either source can forge a token
-for any user — which is why ``jwt_secret_is_default`` exists and main.py
-refuses to start quietly on it in production."""
-
 
 class GatewaySettings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -44,29 +34,39 @@ class GatewaySettings(BaseSettings):
         extra="ignore",
     )
 
-    # ────────────────────────────────────────────────────────────────────── JWT
-    # Mirrors of auth-service's signing settings — see the module docstring.
-    jwt_secret: str = DEFAULT_JWT_SECRET
-    jwt_algorithm: str = "HS256"
-    jwt_issuer: str = "auth-service"
+    # ─────────────────────────────────────────────────────────── token validation
+    # Where to ask "who is this token?". auth-service's GET /auth/me already
+    # answers exactly that — signature, expiry AND its own revocation list —
+    # so no extra endpoint is needed there.
+    #
+    # This must point at auth-service DIRECTLY, not back through this gateway's
+    # own /auth route: routing it through the gateway would make validating a
+    # request require validating a request.
+    introspection_url: str = "http://localhost:8100/auth/me"
 
-    jwt_audience: str = "llm-gateway"
-    """One audience, not a list: the gateway verifies that a token was minted
-    for the platform it fronts. auth-service puts several services in ``aud``
-    (llm-gateway, knowledge-service, ...) and PyJWT accepts a token when the
-    configured audience appears anywhere in that list, so naming any one of
-    them is enough."""
+    introspection_cache_ttl_seconds: float = 60.0
+    """How long one answer is trusted before asking again.
 
-    verify_audience: bool = True
-    """Off only for a deployment whose auth-service predates the ``aud`` claim.
-    Leaving it off in normal operation means a token minted for some other
-    system that happens to share the secret would be accepted here."""
+    This is the revocation lag: a logged-out token keeps working for at most
+    this long. It is also the load control — asking per request would put a
+    round trip in front of all platform traffic. Halve it to make logout bite
+    faster, and double auth-service's call volume."""
+
+    introspection_stale_grace_seconds: float = 300.0
+    """How long a cached answer may still be used when auth-service is
+    UNREACHABLE (never when it is merely stale). Keeps a brief auth-service
+    outage from taking the whole platform down. 0 fails closed immediately."""
+
+    introspection_timeout_seconds: float = 10.0
+    """Kept modest: this sits in front of a request the caller is waiting on,
+    so a wedged auth-service should surface as a fast 504 rather than holding
+    the connection open for minutes."""
 
     auth_enabled: bool = True
-    """The master switch on the JWT gate. Off means every route is public and
-    every caller is anonymous — useful for a local smoke test against a
-    gateway with no auth-service running, catastrophic anywhere else, so
-    main.py logs an error at startup when it is off in production."""
+    """The master switch on the gate. Off means every route is public and every
+    caller anonymous — for a local smoke test with no auth-service running,
+    catastrophic anywhere else, so main.py logs an error when it is off in
+    production."""
 
     # ──────────────────────────────────────────────────────────────── upstreams
     # The route table: which path prefix belongs to which service.
@@ -95,7 +95,7 @@ class GatewaySettings(BaseSettings):
 
     # ────────────────────────────────────────────────────────── secured or not
     # Which routed paths may be reached WITHOUT a token. Everything else needs
-    # a valid JWT — see features/access_policy.py for the entry syntax and for
+    # a valid token — see features/access_policy.py for the entry syntax and for
     # why "private by default" is the only safe direction for this list.
     #
     # The default opens exactly the endpoints that cannot possibly carry a
@@ -110,13 +110,7 @@ class GatewaySettings(BaseSettings):
         "POST:/auth/organizations/register"
     )
 
-    # Paths that END a session. When a request to one of these succeeds, the
-    # gateway records the token's ID as revoked so it stops being accepted
-    # here immediately — see features/revocation.py for why local verification
-    # makes this necessary, and app/controllers/proxy_controller.py for how it
-    # stays a pure passthrough while doing it. Empty disables the behaviour.
-    logout_paths: str = "/auth/logout"
-
+    # ──────────────────────────────────────────────────────── upstream timeouts
     upstream_timeout_seconds: float = 120.0
     """Generous by design: an LLM completion or a document ingest legitimately
     runs for minutes, and a gateway that gives up before the service it fronts
@@ -177,50 +171,19 @@ class GatewaySettings(BaseSettings):
     counters to a hard crash is an acceptable price for that."""
 
     # ────────────────────────────────────────────────────────────────── storage
-    # Optional. With no URI the gateway keeps usage counters and the revoked
-    # token set in-process: correct for a single replica, and the counters
-    # simply reset on restart. Set it for anything with more than one replica —
-    # otherwise each replica meters only its own traffic and honours only the
-    # logouts it personally handled.
+    # Optional, and only used for usage counters now that revocation belongs to
+    # auth-service. With no URI they are kept in-process: correct for a single
+    # replica, and they reset on restart. Set it for anything with more than
+    # one replica, otherwise each replica reports only its own traffic.
     mongo_uri: str = ""
     mongo_db_name: str = "portless"
     usage_collection: str = "gateway_usage"
 
-    revoked_tokens_collection: str = "revoked_tokens"
-    """Deliberately the SAME collection name auth-service uses. Pointed at the
-    same database, the gateway's revocation checks and auth-service's own
-    blacklist become one store, so a token revoked by either is dead to both.
-    Pointed at a different database they stay independent and the gateway still
-    honours every logout it handled itself — which, since it is the only
-    ingress, is all of them."""
-
     # ─────────────────────────────────────────────────────────────────── derived
 
     @property
-    def jwt_secret_is_default(self) -> bool:
-        return self.jwt_secret == DEFAULT_JWT_SECRET
-
-    @property
-    def jwt_secret_is_insecure(self) -> bool:
-        """True when the signing key is the built-in default OR blank.
-
-        The blank case is the one worth spelling out. ``GATEWAY_JWT_SECRET=``
-        with nothing after it is what a half-filled .env looks like, and it is
-        NOT the default value — so a check that only compared against the
-        default would wave it through. An empty HMAC key still signs and
-        verifies, so the failure is silent in both directions: against a real
-        auth-service every request 401s for no visible reason, and against
-        another blank-keyed service everything "works" with no security at all.
-        """
-        return self.jwt_secret_is_default or not self.jwt_secret.strip()
-
-    def parsed_logout_paths(self) -> frozenset[str]:
-        """Normalised set of session-ending paths (no trailing slashes)."""
-        return frozenset(
-            p.strip().rstrip("/")
-            for p in self.logout_paths.split(",")
-            if p.strip()
-        )
+    def introspection_configured(self) -> bool:
+        return bool(self.introspection_url.strip())
 
     def parsed_rate_limit_overrides(self) -> dict[str, int]:
         """``{principal: rpm}``. Malformed entries are logged and skipped

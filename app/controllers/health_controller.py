@@ -16,10 +16,12 @@ an honest 502 for the rest — all of which requires it to keep receiving
 requests. Reporting itself unready would take the whole platform down because
 one service behind it was.
 
-That applies to auth-service too, now that it is an ordinary upstream: a
-gateway whose auth-service is down still serves every request that carries an
-already-valid token, because tokens are verified locally. Use /health/upstreams
-to see which services are actually reachable.
+auth-service is the exception, and readiness says so. Every authenticated
+request now needs it to validate the token, so while it is unreachable the
+gateway serves only cached validations (for the stale-grace window) and then
+starts failing closed. That is reported as "degraded" rather than fatal: a
+gateway that removed itself from the load balancer would also stop serving the
+public paths and the cached traffic it can still handle.
 """
 from __future__ import annotations
 
@@ -56,6 +58,24 @@ async def live() -> LivenessResponse:
 async def _readiness(registry: ServiceRegistry) -> ReadinessResponse:
     deps: list[DependencyStatus] = []
 
+    # ── token validation ────────────────────────────────────────────────────
+    # Configuration only — no probe. Calling auth-service on every readiness
+    # check would add a request per probe interval per replica to the service
+    # that is already in the path of all authenticated traffic.
+    deps.append(
+        DependencyStatus(
+            name="token_validation",
+            status="ok" if gateway_settings.introspection_configured else "unavailable",
+            detail=(
+                f"auth-service at {gateway_settings.introspection_url} "
+                f"(cached {gateway_settings.introspection_cache_ttl_seconds:.0f}s)"
+                if gateway_settings.introspection_configured
+                else "GATEWAY_INTROSPECTION_URL is empty — every authenticated "
+                "request will fail with 502"
+            ),
+        )
+    )
+
     # ── route table ─────────────────────────────────────────────────────────
     # Configuration, not connectivity — whether the upstreams are actually up
     # is /health/upstreams, deliberately not part of readiness (see above).
@@ -85,8 +105,7 @@ async def _readiness(registry: ServiceRegistry) -> ReadinessResponse:
                     detail=(
                         f"db={conn.db_name}"
                         if healthy
-                        else "ping failed — usage counters and shared revocation "
-                        "are degraded to in-process only"
+                        else "ping failed — usage counters degrade to in-process only"
                     ),
                 )
             )
@@ -99,8 +118,8 @@ async def _readiness(registry: ServiceRegistry) -> ReadinessResponse:
             DependencyStatus(
                 name="mongodb",
                 status="ok",
-                detail="not configured — usage counters and revocations are "
-                "in-process (fine for a single replica)",
+                detail="not configured — usage counters are in-process "
+                "(fine for a single replica)",
             )
         )
 

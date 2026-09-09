@@ -33,7 +33,7 @@ import httpx
 from .config import gateway_settings
 from .errors import UpstreamError
 from .registry import Route
-from .tokens import CallerIdentity
+from .identity import CallerIdentity
 
 logger = logging.getLogger(__name__)
 

@@ -118,9 +118,14 @@ class ConfigResponse(BaseModel):
     """The paths reachable without a token, as configured. Worth having on the
     same page as everything else: "why is this endpoint 401ing" and "why is
     this endpoint NOT 401ing" are both answered here."""
-    jwt_issuer: str = ""
-    jwt_audience: str = ""
-    jwt_secret_is_default: bool = False
+    introspection_url: str = ""
+    """Where tokens are validated. The gateway holds no signing key — it asks
+    auth-service."""
+    introspection_cache_ttl_seconds: float = 0.0
+    """How long a validation is trusted. This IS the revocation lag: a
+    logged-out token keeps working for at most this long."""
+    introspection_stale_grace_seconds: float = 0.0
+    introspection_cache_entries: int = 0
     rate_limit_enabled: bool = True
     user_rpm: int = 0
     account_rpm: int = 0

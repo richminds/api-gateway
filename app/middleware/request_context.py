@@ -45,7 +45,7 @@ from features.log_context import (
     reset_request_id,
     user_id_scope,
 )
-from features.tokens import ANONYMOUS
+from features.identity import ANONYMOUS
 from features.usage import get_usage_tracker
 
 from ..config import service_settings

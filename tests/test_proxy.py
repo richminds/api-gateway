@@ -10,7 +10,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from .conftest import auth_headers, make_token
+from .conftest import VALID_TOKEN, auth_headers, register_token
 
 
 def seen(response) -> dict:
@@ -95,15 +95,14 @@ def test_bearer_token_is_forwarded_too(client, user_token):
     assert seen(response)["headers"]["authorization"] == f"Bearer {user_token}"
 
 
-def test_portless_flag_is_only_sent_when_true(client):
-    ordinary = client.get(
-        "/api/llm/v1/models", headers=auth_headers(make_token(is_portless=False))
-    )
+def test_portless_flag_is_only_sent_when_true(client, fake_auth):
+    register_token(fake_auth, "tok-ordinary", user_id="u1", is_portless=False)
+    register_token(fake_auth, "tok-staff", user_id="u2", is_portless=True)
+
+    ordinary = client.get("/api/llm/v1/models", headers=auth_headers("tok-ordinary"))
     assert "x-is-portless" not in seen(ordinary)["headers"]
 
-    staff = client.get(
-        "/api/llm/v1/models", headers=auth_headers(make_token(is_portless=True))
-    )
+    staff = client.get("/api/llm/v1/models", headers=auth_headers("tok-staff"))
     assert seen(staff)["headers"]["x-is-portless"] == "true"
 
 

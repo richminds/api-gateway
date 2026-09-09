@@ -5,7 +5,7 @@ import pytest
 
 from features.usage import UsageTracker
 
-from .conftest import auth_headers, make_token
+from .conftest import VALID_TOKEN, auth_headers, register_token
 
 
 # ---------------------------------------------------------------------------
@@ -127,10 +127,10 @@ def test_rejected_requests_are_counted_too(client, staff_token):
     assert anonymous and anonymous[0]["status_4xx"] >= 1
 
 
-def test_usage_is_rolled_up_by_account(client, staff_token):
-    a = make_token(user_id="user-a", account_id="acme", jti="jti-a")
-    b = make_token(user_id="user-b", account_id="acme", jti="jti-b")
-    c = make_token(user_id="user-c", account_id="globex", jti="jti-c")
+def test_usage_is_rolled_up_by_account(client, staff_token, fake_auth):
+    a = register_token(fake_auth, "tok-a", user_id="user-a", account_id="acme")
+    b = register_token(fake_auth, "tok-b", user_id="user-b", account_id="acme")
+    c = register_token(fake_auth, "tok-c", user_id="user-c", account_id="globex")
 
     for token in (a, b, c):
         client.get("/api/llm/v1/models", headers=auth_headers(token))
@@ -141,9 +141,9 @@ def test_usage_is_rolled_up_by_account(client, staff_token):
     assert by_account["globex"] == 1
 
 
-def test_usage_can_be_filtered_to_one_account(client, staff_token):
-    acme = make_token(user_id="user-a", account_id="acme", jti="jti-a")
-    globex = make_token(user_id="user-c", account_id="globex", jti="jti-c")
+def test_usage_can_be_filtered_to_one_account(client, staff_token, fake_auth):
+    acme = register_token(fake_auth, "tok-a", user_id="user-a", account_id="acme")
+    globex = register_token(fake_auth, "tok-c", user_id="user-c", account_id="globex")
     client.get("/api/llm/v1/models", headers=auth_headers(acme))
     client.get("/api/llm/v1/models", headers=auth_headers(globex))
 
@@ -176,10 +176,10 @@ def test_a_user_can_read_their_own_usage(client, user_token):
     assert all(row["user_id"] == "user-1" for row in response.json()["rows"])
 
 
-def test_own_usage_cannot_be_widened_to_another_user(client):
-    """Scoped to the token's own user_id — there is no parameter to widen it."""
-    a = make_token(user_id="user-a", jti="jti-a")
-    b = make_token(user_id="user-b", jti="jti-b")
+def test_own_usage_cannot_be_widened_to_another_user(client, fake_auth):
+    """Scoped to the caller's own user_id — there is no parameter to widen it."""
+    a = register_token(fake_auth, "tok-a", user_id="user-a")
+    b = register_token(fake_auth, "tok-b", user_id="user-b")
     client.get("/api/llm/v1/models", headers=auth_headers(b))
 
     body = client.get(
@@ -195,8 +195,10 @@ def test_rate_limit_and_config_endpoints_are_staff_only(client, user_token, staf
 
 
 def test_config_never_exposes_secrets(client, staff_token):
+    """There is no signing key here to leak any more — the gateway holds none.
+    What it does report is where it validates and how long it caches."""
     body = client.get("/v1/config", headers=auth_headers(staff_token)).json()
-    serialised = str(body)
-    assert "test-secret-not-for-production-use-only" not in serialised
-    assert "jwt_secret" not in body
-    assert body["jwt_secret_is_default"] is False
+    assert not any("secret" in key for key in body)
+    assert "mongo_uri" not in body
+    assert body["mongo_configured"] is False
+    assert body["introspection_url"].endswith("/auth/me")

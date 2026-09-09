@@ -1,14 +1,12 @@
 """MongoDB connection manager for the gateway.
 
-One Motor client shared by the two things here that persist anything — the
-usage counters (usage.py) and the revoked-token set (revocation.py) — rather
-than a pool per concern. Same shape as auth-service's
+One Motor client for the one thing here that persists anything — the usage
+counters (usage.py) — rather than a pool per concern. Same shape as auth-service's
 ``features/mongo_connection.py``, for the same reason: this service has one
 storage dependency, so it should hold one connection to it.
 
 Storage is optional for this service. Everything works with no Mongo at all;
-see each module for what is lost (counters reset on restart, revocations are
-known only to the replica that handled the logout).
+with none configured the counters simply reset on restart and are per-process.
 
 Usage::
 

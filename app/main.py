@@ -5,9 +5,10 @@ is forwarded to the service that owns it, auth-service included. What it adds
 is the cross-cutting work that would otherwise be reimplemented in each
 service, inconsistently:
 
-  * **authenticates** every request against a JWT minted by auth-service,
-    except the paths configured as public (``GATEWAY_PUBLIC_PATHS`` — sign-in
-    and sign-up, which cannot carry a token yet);
+  * **authenticates** every request by asking auth-service to validate the
+    token, except the paths configured as public (``GATEWAY_PUBLIC_PATHS`` —
+    sign-in and sign-up, which cannot carry a token yet). The gateway holds no
+    signing key and understands nothing about token format;
   * **logs** every request in one place, in one format, with a verified user
     and account on it;
   * **meters** requests per user and per account (features/usage.py) and
@@ -36,11 +37,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from features import __version__
 from features.access_policy import build_access_policy
 from features.config import gateway_settings
+from features.introspection import TokenIntrospector
 from features.mongo_connection import close_connection
 from features.proxy import ProxyClient
 from features.rate_limiter import RateLimiter
 from features.registry import build_registry
-from features.revocation import init_revocation_store
 from features.usage import close_usage_tracker, init_usage_tracker
 
 from .config import service_settings
@@ -57,23 +58,17 @@ logger = logging.getLogger(__name__)
 def _warn_on_insecure_config() -> None:
     """Refuse to let an unsafe configuration go unnoticed on a real deployment.
 
-    Both of these are fine on localhost and in CI, and both are severe in
-    production — a default secret means anyone who has read this source can
-    forge a token for any user, and disabled auth means the front door is
-    simply open. Logged at ERROR in production so they surface in alerting
-    rather than scrolling past in a startup log nobody reads.
+    These are fine on localhost and in CI, and severe in production. Logged at
+    ERROR in production so they surface in alerting rather than scrolling past
+    in a startup log nobody reads.
     """
     complain = logger.error if service_settings.is_production else logger.warning
 
-    if gateway_settings.jwt_secret_is_insecure:
-        blank = not gateway_settings.jwt_secret.strip()
+    if not gateway_settings.introspection_configured:
         complain(
-            "GATEWAY_JWT_SECRET is %s. Anyone who has read this source can "
-            "forge a valid token for any user, and tokens from a properly "
-            "configured auth-service will be rejected — every request 401s "
-            "with reason 'invalid_token'. Set it to the same value as "
-            "auth-service's AUTH_JWT_SECRET.",
-            "EMPTY" if blank else "unset — using the built-in development default",
+            "GATEWAY_INTROSPECTION_URL is empty — the gateway has no way to "
+            "validate a token, so EVERY authenticated request will fail with "
+            "502. Point it at auth-service's GET /auth/me."
         )
 
     if not gateway_settings.auth_enabled:
@@ -99,14 +94,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.registry = build_registry()
     app.state.access_policy = build_access_policy()
     app.state.proxy_client = ProxyClient()
+    app.state.introspector = TokenIntrospector()
     await app.state.proxy_client.start()
+    await app.state.introspector.start()
 
-    await init_revocation_store()
     await init_usage_tracker()
 
     logger.info(
-        "API Gateway ready — auth=%s upstreams=%d public=%d storage=%s",
+        "API Gateway ready — auth=%s via %s (cache %.0fs) upstreams=%d public=%d "
+        "storage=%s",
         "enforced" if gateway_settings.auth_enabled else "DISABLED",
+        gateway_settings.introspection_url or "NOTHING CONFIGURED",
+        gateway_settings.introspection_cache_ttl_seconds,
         len(app.state.registry),
         len(app.state.access_policy),
         "mongodb" if gateway_settings.mongo_uri else "in-memory",
@@ -118,6 +117,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # line closes. Reversing these two silently loses the last interval of
     # counters on every single deploy.
     await close_usage_tracker()
+    await app.state.introspector.close()
     await app.state.proxy_client.close()
     if gateway_settings.mongo_uri:
         await close_connection()
@@ -130,11 +130,11 @@ def create_app() -> FastAPI:
         version=__version__,
         description=(
             "Single ingress for the platform. Routes every request to the "
-            "service that owns it, authenticating against auth-service-issued "
-            "JWTs (except the paths configured as public), metering requests "
-            "per user and per account, and enforcing per-user and per-account "
-            "budgets. It implements no endpoints of its own beyond health and "
-            "its own observability."
+            "service that owns it, having auth-service validate the caller's "
+            "token first (except on the paths configured as public), metering "
+            "requests per user and per account, and enforcing per-user and "
+            "per-account budgets. It implements no endpoints of its own beyond "
+            "health and its own observability."
         ),
         lifespan=lifespan,
         root_path=service_settings.root_path,

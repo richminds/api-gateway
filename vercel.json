@@ -3,9 +3,9 @@
   "env": {
     "GATEWAY_ROUTES": "auth:/auth:https://auth-service-zhx8.vercel.app/auth,llm:/api/llm:https://llm-gateway-theta.vercel.app,knowledge:/api/knowledge:https://knowledge-service-topaz.vercel.app",
     "GATEWAY_PUBLIC_PATHS": "POST:/auth/login,POST:/auth/register,POST:/auth/organizations/register",
-    "GATEWAY_LOGOUT_PATHS": "/auth/logout",
-    "GATEWAY_JWT_ISSUER": "auth-service",
-    "GATEWAY_JWT_AUDIENCE": "llm-gateway",
+    "GATEWAY_INTROSPECTION_URL": "https://auth-service-zhx8.vercel.app/auth/me",
+    "GATEWAY_INTROSPECTION_CACHE_TTL_SECONDS": "60",
+    "GATEWAY_INTROSPECTION_STALE_GRACE_SECONDS": "300",
     "APIGW_CORS_ORIGIN_REGEX": "^https://(account-management|knowledge-ingest-ui)[a-z0-9-]*\\.vercel\\.app$"
   }
 }

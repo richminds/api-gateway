@@ -1,11 +1,15 @@
 """Shared fixtures.
 
-The suite never touches a network or a MongoDB. Every upstream — auth-service
-included, since it is now an ordinary upstream — is a single httpx
-``MockTransport`` handler injected through the ``client=`` argument
-``ProxyClient`` already exposes, so the real proxy code paths (header building,
-error translation, streaming, connection release) are the ones under test.
-Only the socket is fake.
+The suite never touches a network or a MongoDB. Two fake services are injected
+as httpx ``MockTransport`` handlers through the ``client=`` arguments that
+``ProxyClient`` and ``TokenIntrospector`` already expose, so the real code
+paths — header building, error translation, streaming, caching, connection
+release — are the ones under test. Only the socket is fake.
+
+**Tokens here are opaque strings**, because that is what they are to the
+gateway now. It does not decode or verify anything; it asks auth-service, and
+the fake below decides. That is why there is no JWT minting in this suite any
+more — a test that needs an invalid token just uses a string the fake rejects.
 
 Env defaults are set *before* any app import because settings objects are
 module-level singletons built at import time; real environment variables
@@ -16,7 +20,7 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("GATEWAY_JWT_SECRET", "test-secret-not-for-production-use-only")
+os.environ.setdefault("GATEWAY_INTROSPECTION_URL", "http://auth.test/auth/me")
 os.environ.setdefault("GATEWAY_MONGO_URI", "")
 os.environ.setdefault(
     "GATEWAY_ROUTES",
@@ -28,87 +32,134 @@ os.environ.setdefault(
     "GATEWAY_PUBLIC_PATHS",
     "POST:/auth/login,POST:/auth/register,POST:/auth/organizations/register",
 )
-os.environ.setdefault("GATEWAY_LOGOUT_PATHS", "/auth/logout")
+# Off by default so a test's first call always reaches the fake auth-service;
+# the caching tests turn it on explicitly for the behaviour they are pinning.
+os.environ.setdefault("GATEWAY_INTROSPECTION_CACHE_TTL_SECONDS", "0")
 os.environ.setdefault("APIGW_ENVIRONMENT", "test")
 os.environ.setdefault("APIGW_LOG_FORMAT", "text")
 
-from datetime import datetime, timedelta, timezone  # noqa: E402
-
 import httpx  # noqa: E402
-import jwt  # noqa: E402
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
 from features.config import gateway_settings  # noqa: E402
+from features.introspection import TokenIntrospector  # noqa: E402
 from features.proxy import ProxyClient  # noqa: E402
-from features.revocation import reset_revocation_store  # noqa: E402
 from features.usage import UsageTracker  # noqa: E402
 
-TEST_SECRET = "test-secret-not-for-production-use-only"
+# Opaque tokens. Their only meaning is what FakeAuthService below decides.
+VALID_TOKEN = "opaque-token-for-user-1"
+STAFF_TOKEN = "opaque-token-for-staff"
+REVOKED_TOKEN = "opaque-token-that-was-revoked"
+EXPIRED_TOKEN = "opaque-token-that-expired"
 
+PROFILES: dict[str, dict] = {
+    VALID_TOKEN: {
+        "user_id": "user-1",
+        "email": "user@example.com",
+        "name": "Test User",
+        "account_id": "acme",
+        "org_id": "org-1",
+        "is_portless": False,
+        "is_admin": False,
+    },
+    STAFF_TOKEN: {
+        "user_id": "staff-1",
+        "email": "staff@portless.io",
+        "name": "Staff",
+        "account_id": "acme",
+        "org_id": "org-1",
+        "is_portless": True,
+        "is_admin": True,
+    },
+}
 
-# ---------------------------------------------------------------------------
-# Token minting — stands in for auth-service's features/security.py
-# ---------------------------------------------------------------------------
-
-def make_token(
-    user_id: str = "user-1",
-    email: str = "user@example.com",
-    name: str = "Test User",
-    account_id: str = "acme",
-    org_id: str = "org-1",
-    is_portless: bool = False,
-    jti: str = "jti-1",
-    expires_in_minutes: int = 60,
-    secret: str = TEST_SECRET,
-    issuer: str = "auth-service",
-    audience: str | list[str] = "llm-gateway,knowledge-service",
-) -> str:
-    """Mint a token shaped exactly like the ones auth-service issues.
-
-    Defaults match a normal signed-in user. Every argument is overridable so a
-    test can produce the specific bad token it wants to prove is rejected.
-    """
-    now = datetime.now(timezone.utc)
-    aud = audience.split(",") if isinstance(audience, str) else audience
-    payload = {
-        "sub": user_id,
-        "email": email,
-        "name": name,
-        "account_id": account_id,
-        "org_id": org_id,
-        "is_portless": is_portless,
-        "iss": issuer,
-        "aud": aud,
-        "jti": jti,
-        "iat": now,
-        "exp": now + timedelta(minutes=expires_in_minutes),
-    }
-    return jwt.encode(payload, secret, algorithm="HS256")
+REJECTIONS: dict[str, str] = {
+    REVOKED_TOKEN: "Token has been revoked — please log in again",
+    EXPIRED_TOKEN: "Invalid or expired token",
+}
 
 
 def auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-# ---------------------------------------------------------------------------
-# The fake platform behind the gateway
-# ---------------------------------------------------------------------------
+def register_token(
+    fake_auth,
+    token: str,
+    *,
+    user_id: str = "user-x",
+    email: str = "",
+    name: str = "",
+    account_id: str = "",
+    org_id: str = "",
+    is_portless: bool = False,
+    is_admin: bool = False,
+) -> str:
+    """Teach the fake auth-service about an opaque token; return the token.
+
+    Replaces the JWT minting this suite used to do. The gateway never inspects
+    a token, so a test only needs auth-service to agree that this string maps
+    to this user.
+    """
+    fake_auth.profiles[token] = {
+        "user_id": user_id,
+        "email": email,
+        "name": name,
+        "account_id": account_id,
+        "org_id": org_id,
+        "is_portless": is_portless,
+        "is_admin": is_admin,
+    }
+    return token
+
+
+class FakeAuthService:
+    """Stands in for auth-service's ``GET /auth/me`` — the validation endpoint.
+
+    ``calls`` is the assertion surface for the caching tests: it counts how
+    many times the gateway actually asked, which is the whole point of the
+    cache.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.fail_with: Exception | None = None
+        self.status_override: int | None = None
+        self.profiles = dict(PROFILES)
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        token = request.headers.get("authorization", "")[7:].strip()
+        self.calls.append(token)
+
+        if self.fail_with is not None:
+            raise self.fail_with
+        if self.status_override is not None:
+            return httpx.Response(self.status_override, json={"detail": "upstream said no"})
+
+        if token in self.profiles:
+            return httpx.Response(200, json=self.profiles[token])
+        return httpx.Response(
+            401, json={"detail": REJECTIONS.get(token, "Invalid or expired token")}
+        )
+
+    def revoke(self, token: str) -> None:
+        """What auth-service does on logout — the token now 401s."""
+        self.profiles.pop(token, None)
+
 
 class FakeUpstreams:
     """Every service behind the gateway, as one transport handler.
 
     Echoes back what it received so proxy tests can assert on exactly what was
-    forwarded — the injected identity headers, the translated path, the body.
-    ``requests`` is the record of everything that reached a service at all,
+    forwarded. ``requests`` is the record of what reached a service at all,
     which is how the gate is tested: a blocked request must leave it empty.
     """
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.status = 200
-        self.logout_status = 204
         self.fail_with: Exception | None = None
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -117,37 +168,24 @@ class FakeUpstreams:
             raise self.fail_with
 
         path = request.url.path
-
         if path == "/health/live":
             return httpx.Response(200, json={"status": "alive"})
 
-        # ── auth-service ────────────────────────────────────────────────────
         if request.url.host == "auth.test":
             if path == "/auth/login":
                 return httpx.Response(
                     200,
                     json={
-                        "access_token": make_token(),
+                        "access_token": VALID_TOKEN,
                         "token_type": "bearer",
                         "user": {"user_id": "user-1", "email": "user@example.com"},
                         "account_id": "acme",
                     },
                 )
             if path == "/auth/register":
-                return httpx.Response(
-                    201,
-                    json={
-                        "access_token": make_token(user_id="user-new"),
-                        "token_type": "bearer",
-                        "user": {"user_id": "user-new", "email": "new@example.com"},
-                    },
-                )
+                return httpx.Response(201, json={"access_token": VALID_TOKEN})
             if path == "/auth/logout":
-                return httpx.Response(self.logout_status)
-            if path == "/auth/me":
-                return httpx.Response(
-                    200, json={"user_id": "user-1", "email": "user@example.com"}
-                )
+                return httpx.Response(204)
 
         return httpx.Response(
             self.status,
@@ -168,23 +206,29 @@ class FakeUpstreams:
 
 
 @pytest.fixture
+def fake_auth() -> FakeAuthService:
+    return FakeAuthService()
+
+
+@pytest.fixture
 def upstreams() -> FakeUpstreams:
     return FakeUpstreams()
 
 
 @pytest.fixture
-def client(upstreams: FakeUpstreams):
+def client(fake_auth: FakeAuthService, upstreams: FakeUpstreams):
     """TestClient with the whole platform faked and all shared state reset.
 
     The app object is module-level (built once at import), so its rate-limit
-    windows, usage counters and revocation set would otherwise leak between
+    windows, usage counters and validation cache would otherwise leak between
     tests and make them order-dependent.
     """
-    reset_revocation_store()
-
     with TestClient(app) as c:
         app.state.proxy_client = ProxyClient(
             client=httpx.AsyncClient(transport=httpx.MockTransport(upstreams.handler))
+        )
+        app.state.introspector = TokenIntrospector(
+            client=httpx.AsyncClient(transport=httpx.MockTransport(fake_auth.handler))
         )
         import features.usage as usage_module
 
@@ -205,15 +249,14 @@ def client(upstreams: FakeUpstreams):
         yield c
 
     app.state.rate_limiter.reset()
-    reset_revocation_store()
 
 
 @pytest.fixture
 def user_token() -> str:
-    return make_token()
+    return VALID_TOKEN
 
 
 @pytest.fixture
 def staff_token() -> str:
-    """A platform-staff token — what the gateway's own admin routes require."""
-    return make_token(user_id="staff-1", email="staff@portless.io", is_portless=True)
+    """Platform staff — what the gateway's own /v1 admin routes require."""
+    return STAFF_TOKEN

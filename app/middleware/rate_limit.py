@@ -25,7 +25,7 @@ from starlette.responses import Response
 
 from features.config import gateway_settings
 from features.rate_limiter import RateLimiter, RateLimitExceeded
-from features.tokens import ANONYMOUS
+from features.identity import ANONYMOUS
 
 from ..config import service_settings
 from ..errors import rate_limited

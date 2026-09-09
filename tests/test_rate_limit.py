@@ -11,7 +11,7 @@ import pytest
 
 from features.rate_limiter import RateLimitExceeded, RateLimiter
 
-from .conftest import auth_headers, make_token
+from .conftest import VALID_TOKEN, auth_headers, register_token
 
 
 # ---------------------------------------------------------------------------
@@ -152,10 +152,10 @@ def test_successful_responses_advertise_the_remaining_budget(client, user_token)
     assert response.headers["x-ratelimit-remaining"] == "9"
 
 
-def test_one_user_being_throttled_does_not_affect_another(client):
+def test_one_user_being_throttled_does_not_affect_another(client, fake_auth):
     client.app.state.rate_limiter._limits["user"] = 1
-    a = make_token(user_id="user-a", jti="jti-a")
-    b = make_token(user_id="user-b", jti="jti-b")
+    a = register_token(fake_auth, "tok-a", user_id="user-a")
+    b = register_token(fake_auth, "tok-b", user_id="user-b")
 
     client.get("/api/llm/v1/models", headers=auth_headers(a))
     assert client.get("/api/llm/v1/models", headers=auth_headers(a)).status_code == 429

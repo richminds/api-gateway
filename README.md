@@ -9,6 +9,10 @@ every service, inconsistently: authenticating the caller, logging the request
 with a verified identity on it, metering it per user and per account, and
 enforcing request budgets.
 
+It holds **no signing key** and decodes nothing. A token is an opaque string it
+hands to auth-service, which answers "who is this?" — having checked the
+signature, the expiry and its own revocation list.
+
 ```
                         ┌──────────────────────────────────────┐
    browser / client     │            api-gateway  :8000        │
@@ -43,37 +47,43 @@ The gateway does not parse those request bodies, re-declare those models, or
 reshape those responses. A field auth-service adds tomorrow arrives at the
 client without a gateway change, because there is nothing here to update.
 
+It also does not **validate** tokens itself. There is no JWT library in this
+service, no signing key, and no revocation store — auth-service owns all three,
+and the gateway asks it.
+
 ---
 
 ## Quick start
 
 ```bash
 cp .env.example .env
-# set GATEWAY_JWT_SECRET to the same value as auth-service's AUTH_JWT_SECRET
+# set GATEWAY_INTROSPECTION_URL to auth-service's /auth/me
 
 make install
 make dev            # http://localhost:8000/docs
 ```
 
-Tokens are verified locally, so you can exercise the gate with no auth-service
-running:
+Validation is delegated, so a running auth-service is required for anything
+authenticated. Sign in through the gateway to get a token:
 
 ```bash
-TOKEN=$(python scripts/mint_token.py --user-id dev-1 --account-id acme)
-
 curl localhost:8000/api/llm/v1/models                       # 401 — no token
-curl -H "Authorization: Bearer $TOKEN" localhost:8000/api/llm/v1/models
-curl -X POST localhost:8000/auth/login -d '{}'              # public — routed
 
-python scripts/smoke_test.py                                # end-to-end checks
+TOKEN=$(curl -s -X POST localhost:8000/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"..."}' | jq -r .access_token)
+
+curl -H "Authorization: Bearer $TOKEN" localhost:8000/api/llm/v1/models
+
+python scripts/smoke_test.py --email you@example.com --password ...
 ```
 
 ---
 
 ## Secured and non-secured endpoints
 
-**Private by default.** A routed path requires a valid JWT unless it is listed
-in `GATEWAY_PUBLIC_PATHS`:
+**Private by default.** A routed path requires a token auth-service accepts,
+unless it is listed in `GATEWAY_PUBLIC_PATHS`:
 
 ```bash
 GATEWAY_PUBLIC_PATHS=POST:/auth/login,POST:/auth/register,POST:/auth/organizations/register
@@ -136,59 +146,68 @@ configuration change, not a code change.
 
 ---
 
-## Token lifecycle
+## How a request is authenticated
 
-auth-service **signs**; the gateway **verifies**. The gateway has no signing key
-of its own.
+auth-service **owns identity**; the gateway asks. There is no shared secret and
+no second implementation of the rules.
 
 ```
-  POST /auth/login  ──►  gateway ──routes──►  auth-service   (mints the JWT)
+  POST /auth/login  ──►  gateway ──routes──►  auth-service   (issues the token)
   ◄──────────────── access_token ─────────────────┘
 
-  GET /api/llm/...  ──►  gateway   verifies the signature LOCALLY
-                            │      (no call to auth-service)
+  GET /api/llm/...  ──►  gateway ──GET /auth/me──►  auth-service
+                            │      "who is this?"        │
+                            │   ◄── user_id, org_id, ... ─┘
                             └──routes──►  llm-gateway, identity headers attached
 ```
 
-Verification is local and deliberately so: a network round trip in front of
-every request would make auth-service a hard dependency of *all* platform
-traffic, and would add a hop's latency to requests that have nothing to do with
-identity.
+The endpoint is auth-service's own `GET /auth/me`, which already checks the
+signature, the expiry **and its revocation list** — no new endpoint was needed
+there. One setting points at it:
 
-Configuration must line up, because HS256 is symmetric:
+```bash
+GATEWAY_INTROSPECTION_URL=https://auth-service.example.com/auth/me
+```
 
-| Gateway | must equal | auth-service |
-|---|---|---|
-| `GATEWAY_JWT_SECRET` | = | `AUTH_JWT_SECRET` |
-| `GATEWAY_JWT_ISSUER` | = | `AUTH_JWT_ISSUER` |
-| `GATEWAY_JWT_AUDIENCE` | ∈ | `AUTH_JWT_AUDIENCE` (a list) |
+Point it **directly** at auth-service, not back through this gateway's `/auth`
+route — that would make validating a request require validating a request.
 
-A mismatch shows up as every request 401ing — check the `reason` field:
-`invalid_token` (secret), `invalid_issuer`, `invalid_audience`, `token_expired`,
-`token_revoked`, `missing_token`.
+### Caching, and the revocation lag it buys
+
+Asking on every request would put a round trip in front of all platform traffic
+and make auth-service a hard dependency of every call. Answers are cached
+against the token for `GATEWAY_INTROSPECTION_CACHE_TTL_SECONDS` (default 60),
+collapsing that to one call per token per TTL.
+
+The cost is stated plainly: **a logged-out token keeps working for at most that
+long.** It is the one knob to turn if you want logout to bite faster, and the
+trade is linear — halve the TTL, double the calls. Set it to 0 to ask every
+time.
+
+Rejections are cached too. A 401 is monotonic — a token auth-service rejects
+never becomes valid again — so caching it is safe, and it stops a client looping
+on a dead token from hammering auth-service.
+
+### When auth-service cannot be reached
+
+| Situation | Result |
+|---|---|
+| Token was validated recently | served from cache, within `GATEWAY_INTROSPECTION_STALE_GRACE_SECONDS` (default 300), with a warning logged |
+| Token is unknown to this instance | **502 / 504 — the request is refused** |
+
+Failing closed is deliberate: admitting unvalidated traffic because the
+validator is down turns an outage into an open front door. Set the grace to 0
+to fail closed immediately in both cases.
+
+Note the status codes — a validation outage is reported as 502/504, never 401.
+The caller's credentials were never the problem, and telling them to log in
+again would be both wrong and useless.
 
 ### Logout
 
-A JWT is stateless: once signed it is valid until `exp`. Since the gateway
-verifies locally, a logout recorded only at auth-service would leave the token
-working here until it expired.
-
-The gateway still does not implement logout — it routes the request and **takes
-note of the result**. When a request to a path in `GATEWAY_LOGOUT_PATHS`
-succeeds, the token's `jti` is recorded as revoked, so it stops being accepted
-at the front door immediately. A *failed* logout revokes nothing: the session
-did not end, and revoking would sign the user out of something still live.
-
-Two mechanisms, either sufficient:
-
-- **Observed logouts** (above) — works with no shared storage, correct for a
-  single replica.
-- **Shared revocation store** — point `GATEWAY_MONGO_URI` and
-  `GATEWAY_REVOKED_TOKENS_COLLECTION` at auth-service's own database and the
-  two blacklists become one, so a token revoked by either side is dead to both.
-  Required for more than one replica.
-
----
+Nothing special happens here. Logout is a routed request to auth-service like
+any other; auth-service revokes the token, and the gateway stops accepting it as
+soon as the cached answer expires. There is no revocation store in this service.
 
 ## What downstream services receive
 
@@ -310,7 +329,9 @@ One envelope for the whole platform:
 | 404 | `route_not_found` | no service is registered for this path |
 | 429 | `rate_limit_exceeded` | over the user, account or IP budget |
 | 502 | `upstream_unavailable` | a service could not be reached |
+| 502 | `auth_service_unavailable` | the token could not be validated — auth-service is down |
 | 504 | `upstream_timeout` | a service did not answer in time |
+| 504 | `auth_service_timeout` | auth-service did not answer in time |
 | 500 | `gateway_misconfigured` | bad route table or configuration |
 
 A service's own status codes pass through untouched — a 409 from auth-service
@@ -339,15 +360,15 @@ features/                portable core — no FastAPI import
   config.py              GATEWAY_* — what it fronts and trusts
   registry.py            the route table
   access_policy.py       which paths are public
-  tokens.py              local JWT verification
-  revocation.py          logged-out tokens
+  introspection.py       validation, delegated to auth-service (cached)
+  identity.py            the caller, as auth-service reported them
   proxy.py               forwarding + identity injection
   rate_limiter.py        sliding windows
   usage.py               request counters
   log_context.py         ambient request/user/account IDs
 sdk/                     GatewayClient — session handling for callers
-scripts/                 mint_token.py, smoke_test.py
-tests/                   145 tests, no network, no MongoDB
+scripts/                 smoke_test.py
+tests/                   154 tests, no network, no MongoDB
 ```
 
 Middleware order is load-bearing and documented in [`app/main.py`](app/main.py):
@@ -361,27 +382,33 @@ runs, sees no identity yet, and quietly budgets every authenticated caller by IP
 
 ```bash
 make install-dev
-make test           # 145 tests
+make test           # 154 tests
 make lint
 make docker-up
 ```
 
-The suite never touches a network or a MongoDB: every upstream is one httpx
-`MockTransport` handler injected through the `client=` argument `ProxyClient`
-already exposes, so the real proxy code paths — header building, error
-translation, streaming, connection release — are the ones under test.
+The suite never touches a network or a MongoDB: auth-service and the upstreams
+are httpx `MockTransport` handlers injected through the `client=` arguments
+`TokenIntrospector` and `ProxyClient` already expose, so the real code paths —
+header building, error translation, streaming, caching, connection release — are
+the ones under test.
+
+Tokens in the suite are **opaque strings**, because that is what they are to the
+gateway. There is no JWT minting: a test that needs an invalid token uses a
+string the fake auth-service rejects.
 
 ---
 
 ## Deployment notes
 
-- **Set `GATEWAY_JWT_SECRET`.** Unset, it falls back to the same development
-  default auth-service uses, and anyone who has read either repository can forge
-  a token for any user.
-- **Set `GATEWAY_MONGO_URI` for more than one replica.** Otherwise each replica
-  meters only its own traffic and honours only the logouts it personally routed.
-  On serverless (Vercel), where instances are ephemeral and independent, treat
-  this as required rather than optional.
+- **Set `GATEWAY_INTROSPECTION_URL`.** Without it nothing can be validated and
+  every authenticated request fails with 502. The gateway logs an error at
+  startup when it is empty.
+- **auth-service is now on the critical path.** Every authenticated request
+  needs it (modulo the cache), so its availability is the platform's
+  availability. Size the TTL and stale grace accordingly.
+- **Set `GATEWAY_MONGO_URI` for more than one replica** if you want usage
+  counters merged across instances. Revocation no longer depends on it.
 - **Only this service should be publicly reachable.** The whole model assumes
   auth-service, llm-gateway and knowledge-service are on a private network.
 - **`APIGW_TRUST_FORWARDED_FOR` stays false** unless a load balancer you control
@@ -405,7 +432,7 @@ VITE_API_BASE_URL=https://api.example.com/api/knowledge
 Git Bash rewrites environment values that look like Unix paths, so
 
 ```bash
-export GATEWAY_LOGOUT_PATHS=/auth/logout      # becomes C:/Program Files/Git/auth/logout
+export GATEWAY_INTROSPECTION_URL=/auth/me   # becomes C:/Program Files/Git/auth/me
 ```
 
 silently mangles any setting whose value starts with `/` — `GATEWAY_PUBLIC_PATHS`

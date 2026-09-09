@@ -132,36 +132,3 @@ def test_build_reads_the_configured_value():
     p = build_access_policy("POST:/x")
     assert p.is_public("POST", "/x")
     assert not p.is_public("POST", "/y")
-
-
-# ---------------------------------------------------------------------------
-# The signing key — a blank one must not pass as "configured"
-# ---------------------------------------------------------------------------
-
-def test_a_blank_jwt_secret_counts_as_insecure(monkeypatch):
-    """GATEWAY_JWT_SECRET= is what a half-filled .env looks like. It is not the
-    default value, so a check comparing only against the default would wave it
-    through — and an empty HMAC key fails silently in both directions."""
-    from features.config import gateway_settings
-
-    monkeypatch.setattr(gateway_settings, "jwt_secret", "")
-    assert gateway_settings.jwt_secret_is_insecure
-    assert not gateway_settings.jwt_secret_is_default  # exactly the trap
-
-    monkeypatch.setattr(gateway_settings, "jwt_secret", "   ")
-    assert gateway_settings.jwt_secret_is_insecure
-
-
-def test_the_built_in_default_counts_as_insecure(monkeypatch):
-    from features.config import DEFAULT_JWT_SECRET, gateway_settings
-
-    monkeypatch.setattr(gateway_settings, "jwt_secret", DEFAULT_JWT_SECRET)
-    assert gateway_settings.jwt_secret_is_insecure
-    assert gateway_settings.jwt_secret_is_default
-
-
-def test_a_real_secret_is_not_flagged(monkeypatch):
-    from features.config import gateway_settings
-
-    monkeypatch.setattr(gateway_settings, "jwt_secret", "a-real-secret-value")
-    assert not gateway_settings.jwt_secret_is_insecure

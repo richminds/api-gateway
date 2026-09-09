@@ -25,7 +25,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from features import __version__
 from features.config import gateway_settings
 from features.registry import ServiceRegistry
-from features.tokens import CallerIdentity
+from features.identity import CallerIdentity
 from features.usage import get_usage_tracker
 
 from ..config import service_settings
@@ -135,8 +135,9 @@ async def config(request: Request, registry: ServiceRegistry = Depends(get_regis
     """What this instance actually resolved from its environment.
 
     Secrets are never included — not the JWT secret, not the Mongo URI.
-    ``jwt_secret_is_default`` and ``mongo_configured`` report the only thing
-    anyone needs to know about them, which is whether they were set at all.
+    There is no signing key here to leak — the gateway holds none.
+    ``mongo_configured`` reports the only thing anyone needs to know about the
+    Mongo URI, which is whether it was set at all.
     Turn the endpoint off entirely with ``APIGW_EXPOSE_CONFIG_ENDPOINT=false``.
     """
     s = gateway_settings
@@ -145,9 +146,10 @@ async def config(request: Request, registry: ServiceRegistry = Depends(get_regis
         environment=service_settings.environment,
         auth_enabled=s.auth_enabled,
         public_paths=request.app.state.access_policy.describe(),
-        jwt_issuer=s.jwt_issuer,
-        jwt_audience=s.jwt_audience,
-        jwt_secret_is_default=s.jwt_secret_is_default,
+        introspection_url=s.introspection_url,
+        introspection_cache_ttl_seconds=s.introspection_cache_ttl_seconds,
+        introspection_stale_grace_seconds=s.introspection_stale_grace_seconds,
+        introspection_cache_entries=request.app.state.introspector.cache_size(),
         rate_limit_enabled=s.rate_limit_enabled,
         user_rpm=s.user_rpm,
         account_rpm=s.account_rpm,

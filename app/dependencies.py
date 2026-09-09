@@ -13,7 +13,7 @@ from fastapi import Depends, Request
 from features.errors import AuthorizationError
 from features.proxy import ProxyClient
 from features.registry import ServiceRegistry
-from features.tokens import ANONYMOUS, CallerIdentity
+from features.identity import ANONYMOUS, CallerIdentity
 
 
 def get_proxy_client(request: Request) -> ProxyClient:
