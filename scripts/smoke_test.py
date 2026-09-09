@@ -5,7 +5,7 @@
 
 Checks the things a deployment can get wrong that unit tests cannot see: that
 the process actually serves, that the JWT gate is on, that an unauthenticated
-call to a proxied path is refused, and that a valid token gets through. Exits
+call to a routed path is refused, and that a valid token gets through. Exits
 non-zero on the first failure so it can gate a deploy.
 
 It mints its own token (see mint_token.py), so it needs the gateway's signing
@@ -66,9 +66,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument(
-        "--proxied-path",
+        "--secured-path",
         default="/api/llm/v1/models",
-        help="a path behind the gateway, to prove the gate applies to it",
+        help="a routed path that should require a token",
+    )
+    parser.add_argument(
+        "--public-path",
+        default="/auth/login",
+        help="a routed path configured as public (GATEWAY_PUBLIC_PATHS)",
+    )
+    parser.add_argument(
+        "--logout-path",
+        default="/auth/logout",
+        help="the routed path that ends a session (GATEWAY_LOGOUT_PATHS)",
     )
     args = parser.parse_args()
 
@@ -93,11 +103,12 @@ def main() -> int:
             print(f"       · {dep['name']}: {dep['status']} — {dep.get('detail', '')}")
 
     # ── the gate is on ──────────────────────────────────────────────────────
-    anonymous = client.get(args.proxied_path)
+    anonymous = client.get(args.secured_path)
     check(
-        "proxied path rejects an unauthenticated request",
+        "a secured path rejects an unauthenticated request",
         anonymous.status_code == 401,
-        f"HTTP {anonymous.status_code} (expected 401 — is GATEWAY_AUTH_ENABLED false?)",
+        f"HTTP {anonymous.status_code} (expected 401 — is GATEWAY_AUTH_ENABLED false, "
+        "or is this path in GATEWAY_PUBLIC_PATHS?)",
     )
 
     check(
@@ -105,51 +116,51 @@ def main() -> int:
         anonymous.status_code != 401 or "reason" in anonymous.json().get("error", {}),
     )
 
-    # ── sign-in is public ───────────────────────────────────────────────────
-    login = client.post("/auth/login", json={"email": "nobody@example.test", "password": "x"})
+    # ── the configured public path is reachable ─────────────────────────────
+    public = client.post(args.public_path, json={"email": "nobody@example.test", "password": "x"})
     check(
-        "sign-in is reachable without a token",
-        login.status_code != 401,
-        f"HTTP {login.status_code} (a 4xx from auth-service is fine here; 401 from "
-        "the gateway itself is not)",
+        f"{args.public_path} is reachable without a token",
+        public.status_code != 401,
+        f"HTTP {public.status_code} (a 4xx from the service behind it is fine here; "
+        "401 from the gateway itself means it is not in GATEWAY_PUBLIC_PATHS)",
     )
 
     # ── a valid token works ─────────────────────────────────────────────────
     token = mint()
     headers = {"Authorization": f"Bearer {token}"}
 
-    whoami = client.get("/auth/whoami", headers=headers)
-    check("a valid token is accepted", whoami.status_code == 200, f"HTTP {whoami.status_code}")
-    if whoami.status_code == 200:
-        check(
-            "the gateway reads the expected claims",
-            whoami.json().get("user_id") == "smoke-test-user",
-        )
-
-    proxied = client.get(args.proxied_path, headers=headers)
+    routed = client.get(args.secured_path, headers=headers)
     check(
-        "an authenticated request reaches the upstream",
-        proxied.status_code not in (401, 403),
-        f"HTTP {proxied.status_code}"
-        + (" — 502/504 means the upstream is down, not that the gate failed"
-           if proxied.status_code in (502, 504) else ""),
+        "a valid token gets through the gate",
+        routed.status_code not in (401, 403),
+        f"HTTP {routed.status_code}"
+        + (" — 502/504 means the service behind it is down, not that the gate failed"
+           if routed.status_code in (502, 504) else ""),
     )
 
     check(
         "responses carry a correlation ID",
-        bool(proxied.headers.get("x-request-id")),
+        bool(routed.headers.get("x-request-id")),
     )
 
-    # ── logout revokes immediately ──────────────────────────────────────────
-    logout = client.post("/auth/logout", headers=headers)
-    check("logout succeeds", logout.status_code == 200, f"HTTP {logout.status_code}")
-
-    after = client.get("/auth/whoami", headers=headers)
-    check(
-        "the token stops working the moment it is logged out",
-        after.status_code == 401,
-        f"HTTP {after.status_code}",
-    )
+    # ── logout is routed, and noticed ───────────────────────────────────────
+    # The gateway does not implement logout; it forwards it and records the
+    # revocation when the upstream accepts it. If auth-service is not running,
+    # this half cannot be exercised — the token is only revoked on success.
+    logout = client.post(args.logout_path, headers=headers)
+    if 200 <= logout.status_code < 300:
+        after = client.get(args.secured_path, headers=headers)
+        check(
+            "a token stops working once logout succeeds",
+            after.status_code == 401,
+            f"HTTP {after.status_code}",
+        )
+    else:
+        print(
+            f"[SKIP] logout revocation — {args.logout_path} returned "
+            f"HTTP {logout.status_code}; nothing was revoked because the session "
+            "did not end upstream (is auth-service running?)"
+        )
 
     client.close()
 

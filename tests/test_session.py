@@ -1,9 +1,8 @@
-"""Login, logout, and the revocation that makes logout mean something.
+"""Auth traffic through the router, and the revocation that makes logout work.
 
-The logout tests are the ones worth reading. Because the gateway verifies
-tokens locally, a logout recorded only at auth-service would leave the token
-working for every proxied call until it expired — so the gateway records it
-locally too, first, and these tests pin that behaviour down.
+The gateway implements none of this — it routes to auth-service. What it does
+own is noticing a successful logout on the way past, because it verifies tokens
+locally and would otherwise keep accepting a token auth-service has revoked.
 """
 from __future__ import annotations
 
@@ -13,75 +12,83 @@ from .conftest import auth_headers, make_token
 
 
 # ---------------------------------------------------------------------------
-# Login / register pass-through
+# Auth traffic is routed, not reimplemented
 # ---------------------------------------------------------------------------
 
-def test_login_failure_is_passed_through_verbatim(client, fake_auth):
-    """auth-service's own status is the answer — the gateway does not
-    reinterpret it."""
-    fake_auth.login_status = 401
+def test_the_login_response_is_passed_through_untouched(client):
+    """auth-service's answer is the answer — the gateway does not reshape it."""
     response = client.post(
-        "/auth/login", json={"email": "user@example.com", "password": "wrong"}
+        "/auth/login", json={"email": "user@example.com", "password": "hunter22"}
     )
-    assert response.status_code == 401
-    assert response.json()["detail"] == "Invalid email or password"
+    body = response.json()
+    assert set(body) == {"access_token", "token_type", "user", "account_id"}
+    assert body["user"]["user_id"] == "user-1"
 
 
-def test_login_forwards_the_correlation_id_to_auth_service(client, fake_auth):
-    """One ID ties the gateway's log to auth-service's log for one sign-in."""
+def test_the_login_request_body_reaches_auth_service_unchanged(client, upstreams):
+    """No model in the gateway re-validates or strips fields, so a field
+    auth-service adds tomorrow arrives without a gateway change."""
+    client.post(
+        "/auth/login",
+        json={
+            "email": "user@example.com",
+            "password": "hunter22",
+            "account_id": "acme",
+            "some_future_field": "value",
+        },
+    )
+    body = upstreams.requests[0].content.decode()
+    assert "some_future_field" in body
+    assert "acme" in body
+
+
+def test_auth_service_status_codes_are_preserved(client, upstreams):
+    """A 409 from auth-service reaches the client as a 409, not as something
+    the gateway decided to call it."""
+    upstreams.status = 409
+    response = client.get("/auth/accounts", headers=auth_headers(make_token()))
+    assert response.status_code == 409
+
+
+def test_auth_service_being_down_is_a_502(client, upstreams):
+    upstreams.fail_with = httpx.ConnectError("refused")
+    response = client.post(
+        "/auth/login", json={"email": "user@example.com", "password": "hunter22"}
+    )
+    assert response.status_code == 502
+    assert response.json()["error"]["service"] == "auth"
+
+
+def test_authenticated_auth_routes_carry_the_token_upstream(client, user_token, upstreams):
+    client.get("/auth/me", headers=auth_headers(user_token))
+    assert upstreams.requests[0].headers["authorization"] == f"Bearer {user_token}"
+    assert upstreams.requests[0].url.path == "/auth/me"
+
+
+def test_the_correlation_id_reaches_auth_service(client, upstreams):
     client.post(
         "/auth/login",
         json={"email": "user@example.com", "password": "hunter22"},
         headers={"X-Request-ID": "sign-in-42"},
     )
-    assert fake_auth.requests[0].headers["x-request-id"] == "sign-in-42"
-
-
-def test_auth_service_down_on_login_is_502(client, fake_auth):
-    fake_auth.fail_with = httpx.ConnectError("refused")
-    response = client.post(
-        "/auth/login", json={"email": "user@example.com", "password": "hunter22"}
-    )
-    assert response.status_code == 502
-    assert response.json()["error"]["service"] == "auth-service"
-
-
-def test_auth_service_timeout_on_login_is_504(client, fake_auth):
-    fake_auth.fail_with = httpx.ReadTimeout("slow")
-    response = client.post(
-        "/auth/login", json={"email": "user@example.com", "password": "hunter22"}
-    )
-    assert response.status_code == 504
-
-
-def test_me_is_proxied_to_auth_service(client, user_token, fake_auth):
-    response = client.get("/auth/me", headers=auth_headers(user_token))
-    assert response.status_code == 200
-    assert [r.url.path for r in fake_auth.requests] == ["/auth/me"]
-    # The caller's own token is what auth-service is asked with.
-    assert fake_auth.requests[0].headers["authorization"] == f"Bearer {user_token}"
+    assert upstreams.requests[0].headers["x-request-id"] == "sign-in-42"
 
 
 # ---------------------------------------------------------------------------
-# Logout
+# Logout — routed, and noticed
 # ---------------------------------------------------------------------------
 
-def test_logout_succeeds(client, user_token):
+def test_logout_is_routed_to_auth_service(client, user_token, upstreams):
     response = client.post("/auth/logout", headers=auth_headers(user_token))
-    assert response.status_code == 200
-    assert response.json()["status"] == "logged_out"
+    assert response.status_code == 204
+    assert upstreams.paths_seen() == ["/auth/logout"]
 
 
-def test_logout_is_propagated_to_auth_service(client, user_token, fake_auth):
-    client.post("/auth/logout", headers=auth_headers(user_token))
-    assert [r.url.path for r in fake_auth.requests] == ["/auth/logout"]
+def test_a_token_stops_working_the_moment_logout_succeeds(client, user_token, upstreams):
+    """The reason the gateway watches logout go past.
 
-
-def test_token_stops_working_immediately_after_logout(client, user_token, fake_upstream):
-    """The whole point of local revocation.
-
-    Without it the token would keep working at the gateway until it expired,
-    because the gateway does not ask auth-service about ordinary requests.
+    It verifies tokens locally, so without this the token would keep working
+    here until it expired, no matter what auth-service recorded.
     """
     assert client.get("/api/llm/v1/models", headers=auth_headers(user_token)).status_code == 200
 
@@ -92,15 +99,25 @@ def test_token_stops_working_immediately_after_logout(client, user_token, fake_u
     assert after.json()["error"]["reason"] == "token_revoked"
 
 
-def test_logout_blocks_the_auth_endpoints_too(client, user_token):
+def test_logout_blocks_the_routed_auth_endpoints_too(client, user_token):
     client.post("/auth/logout", headers=auth_headers(user_token))
-    assert client.get("/auth/whoami", headers=auth_headers(user_token)).status_code == 401
     assert client.get("/auth/me", headers=auth_headers(user_token)).status_code == 401
 
 
-def test_logout_does_not_affect_other_sessions(client, fake_upstream):
-    """Revocation is per token (per jti), not per user — logging out on your
-    phone must not sign you out on your laptop."""
+def test_a_failed_logout_revokes_nothing(client, user_token, upstreams):
+    """If auth-service refused, the session did not end — revoking here would
+    log the user out of a session that is still live everywhere else."""
+    upstreams.logout_status = 500
+
+    client.post("/auth/logout", headers=auth_headers(user_token))
+
+    still_valid = client.get("/api/llm/v1/models", headers=auth_headers(user_token))
+    assert still_valid.status_code == 200
+
+
+def test_logout_revokes_only_that_token(client, upstreams):
+    """Per jti, not per user — logging out on your phone must not sign you out
+    on your laptop."""
     phone = make_token(jti="jti-phone")
     laptop = make_token(jti="jti-laptop")
 
@@ -110,35 +127,22 @@ def test_logout_does_not_affect_other_sessions(client, fake_upstream):
     assert client.get("/api/llm/v1/models", headers=auth_headers(laptop)).status_code == 200
 
 
-def test_logout_succeeds_even_when_auth_service_is_down(client, user_token, fake_auth):
-    """The local revocation has already happened, so the token is dead
-    everywhere it could still be used through this gateway."""
-    fake_auth.fail_with = httpx.ConnectError("refused")
-
-    response = client.post("/auth/logout", headers=auth_headers(user_token))
-    assert response.status_code == 200
-    assert "unreachable" in response.json()["detail"]
-
-    after = client.get("/api/llm/v1/models", headers=auth_headers(user_token))
-    assert after.status_code == 401
+def test_a_second_logout_is_rejected_by_the_gate(client, user_token, upstreams):
+    assert client.post("/auth/logout", headers=auth_headers(user_token)).status_code == 204
+    # The token is already revoked, so it never reaches auth-service again.
+    assert client.post("/auth/logout", headers=auth_headers(user_token)).status_code == 401
+    assert upstreams.paths_seen() == ["/auth/logout"]
 
 
-def test_logout_is_idempotent(client, user_token):
-    first = client.post("/auth/logout", headers=auth_headers(user_token))
-    assert first.status_code == 200
-    # The second attempt is rejected by the gate itself — the token is already
-    # revoked, so it never reaches the controller.
-    second = client.post("/auth/logout", headers=auth_headers(user_token))
-    assert second.status_code == 401
+def test_logout_paths_are_configurable(client, user_token, upstreams, monkeypatch):
+    """Nothing about "/auth/logout" is special-cased in code — it is a setting,
+    because where logout lives is a fact about the service behind the gateway."""
+    from features.config import gateway_settings
 
+    monkeypatch.setattr(gateway_settings, "logout_paths", "")
 
-def test_an_expired_token_is_not_added_to_the_revocation_set(client):
-    """Nothing to revoke: the token is already dead by expiry, and an entry
-    would only occupy the store until a TTL that has already passed."""
-    from features.revocation import get_revocation_store
+    client.post("/auth/logout", headers=auth_headers(user_token))
 
-    expired = make_token(expires_in_minutes=-1, jti="jti-expired")
-    client.post("/auth/logout", headers=auth_headers(expired))
-
-    store = get_revocation_store()
-    assert len(store) == 0
+    # Routed as before, but no longer treated as ending the session.
+    assert upstreams.paths_seen() == ["/auth/logout"]
+    assert client.get("/api/llm/v1/models", headers=auth_headers(user_token)).status_code == 200

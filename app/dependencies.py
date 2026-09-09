@@ -1,24 +1,19 @@
 """Shared FastAPI dependencies — access to the singletons and the caller.
 
-The long-lived objects (the auth-service client, the proxy connection pool,
-the service registry) are built once in the lifespan and stashed on
-``app.state``. Reaching them through a dependency rather than a module-level
-global is what lets a test build the app with a fake auth-service and a fake
-transport, with no monkeypatching and no network.
+The long-lived objects (the proxy connection pool, the service registry, the
+access policy) are built once in the lifespan and stashed on ``app.state``.
+Reaching them through a dependency rather than a module-level global is what
+lets a test build the app with fake upstreams and a fake transport, with no
+monkeypatching and no network.
 """
 from __future__ import annotations
 
 from fastapi import Depends, Request
 
-from features.auth_client import AuthServiceClient
 from features.errors import AuthorizationError
 from features.proxy import ProxyClient
 from features.registry import ServiceRegistry
 from features.tokens import ANONYMOUS, CallerIdentity
-
-
-def get_auth_client(request: Request) -> AuthServiceClient:
-    return request.app.state.auth_client
 
 
 def get_proxy_client(request: Request) -> ProxyClient:
@@ -40,11 +35,12 @@ def get_identity(request: Request) -> CallerIdentity:
 
 
 def get_token(request: Request) -> str:
-    """The raw bearer token, for the endpoints that forward it to auth-service.
+    """The raw bearer token, forwarded upstream alongside the decoded claims.
 
-    Only the auth controller needs this. Everything else should work from the
-    decoded identity above — re-parsing a token that has already been verified
-    invites the two paths to disagree about who the caller is.
+    Downstream services validate the JWT themselves, so they need the token
+    itself and not only the headers derived from it. Nothing else should reach
+    for this — re-parsing a token that has already been verified invites the
+    two paths to disagree about who the caller is.
     """
     return getattr(request.state, "token", "")
 

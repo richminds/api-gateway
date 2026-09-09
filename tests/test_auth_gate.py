@@ -1,7 +1,8 @@
-"""The core rule: every request needs a JWT except sign-in and sign-up.
+"""Secured vs non-secured endpoints — the rule the gateway enforces.
 
-This is the requirement the gateway exists to satisfy, so it gets the most
-direct tests in the suite.
+Private by default: a path is public only if configured so. These tests pin
+down both halves — that the configured public paths get through without a
+token, and that everything else does not.
 """
 from __future__ import annotations
 
@@ -11,63 +12,88 @@ from .conftest import auth_headers, make_token
 
 
 # ---------------------------------------------------------------------------
-# Public endpoints — reachable with no token at all
+# Configured public paths — routed without a token
 # ---------------------------------------------------------------------------
 
-def test_login_needs_no_token(client, fake_auth):
+def test_login_is_public_and_routed_to_auth_service(client, upstreams):
     response = client.post(
         "/auth/login", json={"email": "user@example.com", "password": "hunter22"}
     )
     assert response.status_code == 200
     assert response.json()["access_token"]
-    assert [r.url.path for r in fake_auth.requests] == ["/auth/login"]
+    # Routed, not implemented: auth-service saw it, at its own path.
+    assert upstreams.paths_seen() == ["/auth/login"]
+    assert upstreams.requests[0].url.host == "auth.test"
 
 
-def test_register_needs_no_token(client):
+def test_register_is_public_and_routed(client, upstreams):
     response = client.post(
         "/auth/register",
         json={"email": "new@example.com", "name": "New User", "password": "hunter22"},
     )
     assert response.status_code == 201
-    assert response.json()["access_token"]
+    assert upstreams.paths_seen() == ["/auth/register"]
 
 
-def test_organization_register_needs_no_token(client):
-    response = client.post("/auth/organizations/register", json={"name": "New Org"})
-    assert response.status_code == 201
-    assert response.json()["org_id"] == "org-new"
+def test_a_public_rule_can_be_scoped_to_one_method(client, upstreams):
+    """The rule is POST:/auth/login — a GET of the same path is not public."""
+    assert client.get("/auth/login").status_code == 401
+    assert upstreams.requests == []
 
 
-@pytest.mark.parametrize("path", ["/health", "/health/live", "/health/ready", "/"])
-def test_health_and_banner_need_no_token(client, path):
-    assert client.get(path).status_code == 200
+def test_gateway_infrastructure_paths_are_always_public(client):
+    for path in ("/", "/health", "/health/live", "/health/ready"):
+        assert client.get(path).status_code == 200
+
+
+def test_cors_preflight_is_never_401(client):
+    """A preflight never carries an Authorization header, by design — a 401 on
+    it breaks every browser client while protecting nothing."""
+    response = client.options(
+        "/api/llm/v1/models",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert response.status_code != 401
 
 
 # ---------------------------------------------------------------------------
-# Everything else requires a valid token
+# Everything else is private
 # ---------------------------------------------------------------------------
 
-def test_proxied_request_without_token_is_401(client, fake_upstream):
+def test_a_routed_service_path_requires_a_token(client, upstreams):
     response = client.get("/api/llm/v1/models")
     assert response.status_code == 401
     assert response.json()["error"]["reason"] == "missing_token"
-    # The point of the gate: the upstream was never contacted.
-    assert fake_upstream.requests == []
+    # The point of the gate: nothing reached the service.
+    assert upstreams.requests == []
 
 
-def test_proxied_request_with_valid_token_reaches_upstream(client, user_token, fake_upstream):
+def test_auth_paths_that_are_not_configured_public_require_a_token(client, upstreams):
+    """/auth/me and /auth/logout are routed like anything else — being under
+    /auth grants nothing."""
+    assert client.get("/auth/me").status_code == 401
+    assert client.post("/auth/logout").status_code == 401
+    assert upstreams.requests == []
+
+
+def test_auth_service_admin_routes_require_a_token(client, upstreams):
+    """The staff endpoints are routed, so they are reachable — but only with a
+    token, and auth-service still enforces its own rules on top."""
+    assert client.get("/auth/accounts").status_code == 401
+    assert client.get("/auth/users").status_code == 401
+    assert upstreams.requests == []
+
+
+def test_a_valid_token_reaches_the_service(client, user_token, upstreams):
     response = client.get("/api/llm/v1/models", headers=auth_headers(user_token))
     assert response.status_code == 200
-    assert len(fake_upstream.requests) == 1
+    assert len(upstreams.requests) == 1
 
 
-def test_auth_endpoints_other_than_login_require_a_token(client):
-    assert client.get("/auth/me").status_code == 401
-    assert client.get("/auth/whoami").status_code == 401
-    assert client.post("/auth/logout").status_code == 401
-
-
-def test_401_carries_www_authenticate_header(client):
+def test_401_carries_www_authenticate(client):
     response = client.get("/api/llm/v1/models")
     assert response.headers["www-authenticate"] == "Bearer"
 
@@ -76,33 +102,22 @@ def test_401_carries_www_authenticate_header(client):
 # Token validation — each failure mode is distinguishable by `reason`
 # ---------------------------------------------------------------------------
 
-def test_expired_token_is_rejected(client, fake_upstream):
-    token = make_token(expires_in_minutes=-5)
-    response = client.get("/api/llm/v1/models", headers=auth_headers(token))
+@pytest.mark.parametrize(
+    "kwargs,reason",
+    [
+        ({"expires_in_minutes": -5}, "token_expired"),
+        ({"secret": "a-different-secret-entirely"}, "invalid_token"),
+        ({"issuer": "some-other-service"}, "invalid_issuer"),
+        ({"audience": ["some-other-platform"]}, "invalid_audience"),
+    ],
+)
+def test_bad_tokens_are_rejected_with_a_specific_reason(client, upstreams, kwargs, reason):
+    response = client.get(
+        "/api/llm/v1/models", headers=auth_headers(make_token(**kwargs))
+    )
     assert response.status_code == 401
-    assert response.json()["error"]["reason"] == "token_expired"
-    assert fake_upstream.requests == []
-
-
-def test_token_signed_with_the_wrong_secret_is_rejected(client):
-    token = make_token(secret="a-different-secret-entirely")
-    response = client.get("/api/llm/v1/models", headers=auth_headers(token))
-    assert response.status_code == 401
-    assert response.json()["error"]["reason"] == "invalid_token"
-
-
-def test_token_from_the_wrong_issuer_is_rejected(client):
-    token = make_token(issuer="some-other-service")
-    response = client.get("/api/llm/v1/models", headers=auth_headers(token))
-    assert response.status_code == 401
-    assert response.json()["error"]["reason"] == "invalid_issuer"
-
-
-def test_token_for_another_audience_is_rejected(client):
-    token = make_token(audience=["some-other-platform"])
-    response = client.get("/api/llm/v1/models", headers=auth_headers(token))
-    assert response.status_code == 401
-    assert response.json()["error"]["reason"] == "invalid_audience"
+    assert response.json()["error"]["reason"] == reason
+    assert upstreams.requests == []
 
 
 def test_garbage_token_is_rejected(client):
@@ -128,29 +143,14 @@ def test_bearer_scheme_is_case_insensitive(client, user_token):
 
 
 # ---------------------------------------------------------------------------
-# whoami — the claims the gateway acts on
+# Local verification
 # ---------------------------------------------------------------------------
 
-def test_whoami_returns_the_verified_claims(client, user_token):
-    response = client.get("/auth/whoami", headers=auth_headers(user_token))
-    assert response.status_code == 200
-    body = response.json()
-    assert body["user_id"] == "user-1"
-    assert body["account_id"] == "acme"
-    assert body["org_id"] == "org-1"
-    assert body["is_portless"] is False
-
-
-def test_whoami_makes_no_call_to_auth_service(client, user_token, fake_auth):
-    """Verification is local — that is the whole design (features/tokens.py)."""
-    client.get("/auth/whoami", headers=auth_headers(user_token))
-    assert fake_auth.requests == []
-
-
-def test_ordinary_proxied_traffic_never_touches_auth_service(
-    client, user_token, fake_auth
-):
-    """The property that keeps auth-service off the critical path."""
+def test_verifying_a_token_costs_no_call_to_auth_service(client, user_token, upstreams):
+    """The property that keeps auth-service off the critical path: routed
+    traffic is verified locally and only touches the service it was for."""
     for _ in range(5):
         client.get("/api/llm/v1/models", headers=auth_headers(user_token))
-    assert fake_auth.requests == []
+
+    assert len(upstreams.requests) == 5
+    assert all(r.url.host == "llm.test" for r in upstreams.requests)

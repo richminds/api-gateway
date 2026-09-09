@@ -1,11 +1,11 @@
 """Shared fixtures.
 
-The suite never touches a network, a MongoDB or a real auth-service. Two fake
-upstreams are injected as httpx ``MockTransport`` handlers through the same
-constructor argument the production classes already expose (``client=``), so
-the real ``AuthServiceClient`` and ``ProxyClient`` code paths — header
-building, error translation, streaming, connection release — are the ones
-under test. Only the socket is fake.
+The suite never touches a network or a MongoDB. Every upstream — auth-service
+included, since it is now an ordinary upstream — is a single httpx
+``MockTransport`` handler injected through the ``client=`` argument
+``ProxyClient`` already exposes, so the real proxy code paths (header building,
+error translation, streaming, connection release) are the ones under test.
+Only the socket is fake.
 
 Env defaults are set *before* any app import because settings objects are
 module-level singletons built at import time; real environment variables
@@ -18,11 +18,17 @@ import os
 
 os.environ.setdefault("GATEWAY_JWT_SECRET", "test-secret-not-for-production-use-only")
 os.environ.setdefault("GATEWAY_MONGO_URI", "")
-os.environ.setdefault("GATEWAY_AUTH_SERVICE_URL", "http://auth-service.test")
 os.environ.setdefault(
     "GATEWAY_ROUTES",
-    "llm:/api/llm:http://llm.test,knowledge:/api/knowledge:http://knowledge.test",
+    "auth:/auth:http://auth.test/auth,"
+    "llm:/api/llm:http://llm.test,"
+    "knowledge:/api/knowledge:http://knowledge.test",
 )
+os.environ.setdefault(
+    "GATEWAY_PUBLIC_PATHS",
+    "POST:/auth/login,POST:/auth/register,POST:/auth/organizations/register",
+)
+os.environ.setdefault("GATEWAY_LOGOUT_PATHS", "/auth/logout")
 os.environ.setdefault("APIGW_ENVIRONMENT", "test")
 os.environ.setdefault("APIGW_LOG_FORMAT", "text")
 
@@ -34,7 +40,6 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
-from features.auth_client import AuthServiceClient  # noqa: E402
 from features.config import gateway_settings  # noqa: E402
 from features.proxy import ProxyClient  # noqa: E402
 from features.revocation import reset_revocation_store  # noqa: E402
@@ -63,8 +68,7 @@ def make_token(
     """Mint a token shaped exactly like the ones auth-service issues.
 
     Defaults match a normal signed-in user. Every argument is overridable so a
-    test can produce the specific bad token it wants to prove is rejected —
-    wrong secret, wrong issuer, expired, and so on.
+    test can produce the specific bad token it wants to prove is rejected.
     """
     now = datetime.now(timezone.utc)
     aud = audience.split(",") if isinstance(audience, str) else audience
@@ -89,20 +93,21 @@ def auth_headers(token: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Fake upstreams
+# The fake platform behind the gateway
 # ---------------------------------------------------------------------------
 
-class FakeAuthService:
-    """A stand-in for auth-service that records what it was asked.
+class FakeUpstreams:
+    """Every service behind the gateway, as one transport handler.
 
-    ``requests`` is the assertion surface for the tests that care about *how*
-    the gateway called it — that logout was propagated, that the correlation ID
-    was forwarded, that a bearer token was passed on.
+    Echoes back what it received so proxy tests can assert on exactly what was
+    forwarded — the injected identity headers, the translated path, the body.
+    ``requests`` is the record of everything that reached a service at all,
+    which is how the gate is tested: a blocked request must leave it empty.
     """
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
-        self.login_status = 200
+        self.status = 200
         self.logout_status = 204
         self.fail_with: Exception | None = None
 
@@ -113,96 +118,43 @@ class FakeAuthService:
 
         path = request.url.path
 
-        if path == "/auth/login":
-            if self.login_status != 200:
-                return httpx.Response(
-                    self.login_status,
-                    json={"detail": "Invalid email or password"},
-                )
-            return httpx.Response(
-                200,
-                json={
-                    "access_token": make_token(),
-                    "token_type": "bearer",
-                    "user": {
-                        "user_id": "user-1",
-                        "email": "user@example.com",
-                        "name": "Test User",
-                        "account_id": "acme",
-                        "org_id": "org-1",
-                    },
-                    "account_id": "acme",
-                    "accounts": [{"account_id": "acme", "name": "Acme"}],
-                },
-            )
-
-        if path == "/auth/register":
-            return httpx.Response(
-                201,
-                json={
-                    "access_token": make_token(user_id="user-new"),
-                    "token_type": "bearer",
-                    "user": {
-                        "user_id": "user-new",
-                        "email": "new@example.com",
-                        "name": "New User",
-                    },
-                },
-            )
-
-        if path == "/auth/logout":
-            return httpx.Response(self.logout_status)
-
-        if path == "/auth/me":
-            return httpx.Response(
-                200,
-                json={
-                    "user_id": "user-1",
-                    "email": "user@example.com",
-                    "name": "Test User",
-                    "account_id": "acme",
-                    "org_id": "org-1",
-                },
-            )
-
-        if path == "/auth/organizations/register":
-            return httpx.Response(
-                201, json={"org_id": "org-new", "name": "New Org", "created_by": "self-serve"}
-            )
-
         if path == "/health/live":
             return httpx.Response(200, json={"status": "alive"})
 
-        return httpx.Response(404, json={"detail": "not found"})
-
-
-class FakeUpstream:
-    """A stand-in for llm-gateway / knowledge-service.
-
-    Echoes back the path, method, query, headers and body it received, which is
-    what lets the proxy tests assert on exactly what the gateway forwarded —
-    including the identity headers it injected and the ones it stripped.
-    """
-
-    def __init__(self) -> None:
-        self.requests: list[httpx.Request] = []
-        self.status = 200
-        self.fail_with: Exception | None = None
-
-    def handler(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        if self.fail_with is not None:
-            raise self.fail_with
-
-        if request.url.path == "/health/live":
-            return httpx.Response(200, json={"status": "alive"})
+        # ── auth-service ────────────────────────────────────────────────────
+        if request.url.host == "auth.test":
+            if path == "/auth/login":
+                return httpx.Response(
+                    200,
+                    json={
+                        "access_token": make_token(),
+                        "token_type": "bearer",
+                        "user": {"user_id": "user-1", "email": "user@example.com"},
+                        "account_id": "acme",
+                    },
+                )
+            if path == "/auth/register":
+                return httpx.Response(
+                    201,
+                    json={
+                        "access_token": make_token(user_id="user-new"),
+                        "token_type": "bearer",
+                        "user": {"user_id": "user-new", "email": "new@example.com"},
+                    },
+                )
+            if path == "/auth/logout":
+                return httpx.Response(self.logout_status)
+            if path == "/auth/me":
+                return httpx.Response(
+                    200, json={"user_id": "user-1", "email": "user@example.com"}
+                )
 
         return httpx.Response(
             self.status,
             json={
                 "seen": {
                     "method": request.method,
-                    "path": request.url.path,
+                    "path": path,
                     "query": request.url.query.decode(),
                     "headers": {k.lower(): v for k, v in request.headers.items()},
                     "body": request.content.decode() if request.content else "",
@@ -211,51 +163,36 @@ class FakeUpstream:
             },
         )
 
-
-@pytest.fixture
-def fake_auth() -> FakeAuthService:
-    return FakeAuthService()
+    def paths_seen(self) -> list[str]:
+        return [r.url.path for r in self.requests]
 
 
 @pytest.fixture
-def fake_upstream() -> FakeUpstream:
-    return FakeUpstream()
+def upstreams() -> FakeUpstreams:
+    return FakeUpstreams()
 
 
 @pytest.fixture
-def client(fake_auth: FakeAuthService, fake_upstream: FakeUpstream):
-    """TestClient with both upstreams faked and all shared state reset.
+def client(upstreams: FakeUpstreams):
+    """TestClient with the whole platform faked and all shared state reset.
 
     The app object is module-level (built once at import), so its rate-limit
     windows, usage counters and revocation set would otherwise leak between
-    tests and make them order-dependent. Everything stateful is reset here.
+    tests and make them order-dependent.
     """
     reset_revocation_store()
 
     with TestClient(app) as c:
-        # Swapped after startup so the lifespan's real construction still runs;
-        # both classes take an injected client as a public constructor argument
-        # precisely so this needs no monkeypatching.
-        app.state.auth_client = AuthServiceClient(
-            client=httpx.AsyncClient(
-                transport=httpx.MockTransport(fake_auth.handler),
-                base_url=gateway_settings.auth_service_url,
-            )
-        )
         app.state.proxy_client = ProxyClient(
-            client=httpx.AsyncClient(transport=httpx.MockTransport(fake_upstream.handler))
+            client=httpx.AsyncClient(transport=httpx.MockTransport(upstreams.handler))
         )
-        # A fresh tracker per test, and detached from Mongo, so counts start at
-        # zero and nothing schedules a flush.
         import features.usage as usage_module
 
         usage_module._tracker = UsageTracker(collection=None)
 
         # Both the windows AND the ceilings are restored. The ceilings matter
-        # because a test that lowers one (to make going over budget cheap) is
-        # otherwise mutating the module-level app for every test that follows
-        # it — which shows up as unrelated tests in later files getting 429s
-        # they never asked for.
+        # because a test that lowers one is otherwise mutating the module-level
+        # app for every test that follows it.
         app.state.rate_limiter.reset()
         app.state.rate_limiter._limits.update(
             {
@@ -278,5 +215,5 @@ def user_token() -> str:
 
 @pytest.fixture
 def staff_token() -> str:
-    """A platform-staff token — what the gateway's admin routes require."""
+    """A platform-staff token — what the gateway's own admin routes require."""
     return make_token(user_id="staff-1", email="staff@portless.io", is_portless=True)

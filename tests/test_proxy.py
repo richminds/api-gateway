@@ -29,10 +29,10 @@ def test_prefix_is_stripped_before_forwarding(client, user_token):
     assert seen(response)["path"] == "/v1/models"
 
 
-def test_each_prefix_reaches_its_own_service(client, user_token, fake_upstream):
+def test_each_prefix_reaches_its_own_service(client, user_token, upstreams):
     client.get("/api/llm/v1/chat", headers=auth_headers(user_token))
     client.get("/api/knowledge/v1/query", headers=auth_headers(user_token))
-    hosts = [r.url.host for r in fake_upstream.requests]
+    hosts = [r.url.host for r in upstreams.requests]
     assert hosts == ["llm.test", "knowledge.test"]
 
 
@@ -67,8 +67,8 @@ def test_every_method_is_proxied(client, user_token, method):
     assert seen(response)["method"] == method
 
 
-def test_upstream_status_code_is_passed_through(client, user_token, fake_upstream):
-    fake_upstream.status = 422
+def test_upstream_status_code_is_passed_through(client, user_token, upstreams):
+    upstreams.status = 422
     response = client.get("/api/llm/v1/models", headers=auth_headers(user_token))
     assert response.status_code == 422
 
@@ -190,8 +190,8 @@ def test_host_header_names_the_upstream(client, user_token):
 # Upstream failures
 # ---------------------------------------------------------------------------
 
-def test_unreachable_upstream_is_502(client, user_token, fake_upstream):
-    fake_upstream.fail_with = httpx.ConnectError("connection refused")
+def test_unreachable_upstream_is_502(client, user_token, upstreams):
+    upstreams.fail_with = httpx.ConnectError("connection refused")
     response = client.get("/api/llm/v1/models", headers=auth_headers(user_token))
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "upstream_unavailable"
@@ -199,16 +199,16 @@ def test_unreachable_upstream_is_502(client, user_token, fake_upstream):
     assert response.json()["error"]["service"] == "llm"
 
 
-def test_upstream_timeout_is_504(client, user_token, fake_upstream):
-    fake_upstream.fail_with = httpx.ReadTimeout("too slow")
+def test_upstream_timeout_is_504(client, user_token, upstreams):
+    upstreams.fail_with = httpx.ReadTimeout("too slow")
     response = client.get("/api/llm/v1/models", headers=auth_headers(user_token))
     assert response.status_code == 504
     assert response.json()["error"]["code"] == "upstream_timeout"
 
 
-def test_errors_carry_the_request_id(client, user_token, fake_upstream):
+def test_errors_carry_the_request_id(client, user_token, upstreams):
     """What turns "it failed" in a bug report into the exact log line."""
-    fake_upstream.fail_with = httpx.ConnectError("nope")
+    upstreams.fail_with = httpx.ConnectError("nope")
     response = client.get(
         "/api/llm/v1/models",
         headers={**auth_headers(user_token), "X-Request-ID": "find-me"},

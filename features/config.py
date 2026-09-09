@@ -44,19 +44,6 @@ class GatewaySettings(BaseSettings):
         extra="ignore",
     )
 
-    # ───────────────────────────────────────────────────────────── auth-service
-    # The gateway is the ONLY service that may call auth-service — that is the
-    # whole point of this deployment topology. Nothing else needs its URL, and
-    # in a correct network policy nothing else can reach it: auth-service binds
-    # to the private network and only this service's security group talks to it.
-    auth_service_url: str = "http://localhost:8100"
-
-    auth_service_timeout_seconds: float = 10.0
-    """Sign-in does a bcrypt verify (deliberately slow, ~100ms at cost 12) plus
-    a Mongo round trip. 10s is generous for that and still well under any sane
-    client timeout, so a wedged auth-service surfaces as a clean 504 rather
-    than hanging the caller's connection."""
-
     # ────────────────────────────────────────────────────────────────────── JWT
     # Mirrors of auth-service's signing settings — see the module docstring.
     jwt_secret: str = DEFAULT_JWT_SECRET
@@ -87,13 +74,48 @@ class GatewaySettings(BaseSettings):
     #   GATEWAY_ROUTES=llm:/api/llm:http://localhost:8080,knowledge:/api/knowledge:http://localhost:8090
     #
     # Each entry is name:prefix:base_url — see registry.py::parse_routes for the
-    # parsing rules (the URL's own "http://" colons are not separators). The
-    # default wires up the two services that exist today at their documented dev
-    # ports, so "python run.py" works with no configuration at all.
+    # parsing rules (the URL's own "http://" colons are not separators).
+    #
+    # auth-service is in here as an ordinary upstream, exactly like the others.
+    # The gateway does not implement sign-in; it routes to the service that
+    # does. It remains the only caller of auth-service either way — being the
+    # sole ingress is what makes that true, not having hand-written endpoints.
+    #
+    # Note the auth entry's base_url carries a PATH (".../auth"). auth-service
+    # serves its routes under /auth, and the gateway strips the matched prefix
+    # before forwarding, so public "/auth/login" becomes "/login" and the base
+    # URL's path puts it back: http://localhost:8100/auth/login. That keeps the
+    # public path identical to what the UIs already call, so pointing them at
+    # the gateway is a base-URL change and nothing else.
     routes: str = (
+        "auth:/auth:http://localhost:8100/auth,"
         "llm:/api/llm:http://localhost:8080,"
         "knowledge:/api/knowledge:http://localhost:8090"
     )
+
+    # ────────────────────────────────────────────────────────── secured or not
+    # Which routed paths may be reached WITHOUT a token. Everything else needs
+    # a valid JWT — see features/access_policy.py for the entry syntax and for
+    # why "private by default" is the only safe direction for this list.
+    #
+    # The default opens exactly the endpoints that cannot possibly carry a
+    # token yet: signing in, signing up, and creating an organization (which
+    # has no members who could hold one). Everything else auth-service exposes
+    # — /auth/me, /auth/logout, /auth/accounts, the staff routes — is routed
+    # like any other traffic and requires a token, with auth-service still
+    # enforcing its own rules on top.
+    public_paths: str = (
+        "POST:/auth/login,"
+        "POST:/auth/register,"
+        "POST:/auth/organizations/register"
+    )
+
+    # Paths that END a session. When a request to one of these succeeds, the
+    # gateway records the token's ID as revoked so it stops being accepted
+    # here immediately — see features/revocation.py for why local verification
+    # makes this necessary, and app/controllers/proxy_controller.py for how it
+    # stays a pure passthrough while doing it. Empty disables the behaviour.
+    logout_paths: str = "/auth/logout"
 
     upstream_timeout_seconds: float = 120.0
     """Generous by design: an LLM completion or a document ingest legitimately
@@ -177,6 +199,14 @@ class GatewaySettings(BaseSettings):
     @property
     def jwt_secret_is_default(self) -> bool:
         return self.jwt_secret == DEFAULT_JWT_SECRET
+
+    def parsed_logout_paths(self) -> frozenset[str]:
+        """Normalised set of session-ending paths (no trailing slashes)."""
+        return frozenset(
+            p.strip().rstrip("/")
+            for p in self.logout_paths.split(",")
+            if p.strip()
+        )
 
     def parsed_rate_limit_overrides(self) -> dict[str, int]:
         """``{principal: rpm}``. Malformed entries are logged and skipped

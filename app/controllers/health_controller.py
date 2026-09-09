@@ -2,24 +2,24 @@
 
     GET /health            readiness (alias of /health/ready)
     GET /health/live       liveness — the process is up, no I/O
-    GET /health/ready      readiness — auth-service reachable, storage healthy
+    GET /health/ready      readiness — route table and storage
     GET /health/upstreams  live probe of every registered service
 
-Liveness must never touch a dependency: a Mongo blip or a restarting
-auth-service should not get this container killed. Readiness may, because that
-is exactly the signal a load balancer needs.
+Liveness must never touch a dependency: a Mongo blip or a restarting upstream
+should not get this container killed. Readiness may, because that is exactly
+the signal a load balancer needs.
 
-The distinction that matters here, and it is specific to a gateway: **a down
-upstream is not an unready gateway.** If llm-gateway is unreachable, this
-service should stay in the load balancer, keep serving knowledge-service
-traffic, and return an honest 502 for the rest — all of which requires it to
-keep receiving requests. Reporting itself unready would take the whole
-platform down because one service behind it was.
+The distinction that matters here is specific to a gateway: **a down upstream
+is not an unready gateway.** If llm-gateway is unreachable, this service should
+stay in the load balancer, keep serving knowledge-service traffic, and return
+an honest 502 for the rest — all of which requires it to keep receiving
+requests. Reporting itself unready would take the whole platform down because
+one service behind it was.
 
-auth-service is treated differently: without it nobody can sign in at all, so
-it is a real readiness dependency. Even then it is reported as "degraded"
-rather than fatal, since traffic holding a valid token is served entirely from
-local verification and does not touch auth-service at all.
+That applies to auth-service too, now that it is an ordinary upstream: a
+gateway whose auth-service is down still serves every request that carries an
+already-valid token, because tokens are verified locally. Use /health/upstreams
+to see which services are actually reachable.
 """
 from __future__ import annotations
 
@@ -31,11 +31,10 @@ import httpx
 from fastapi import APIRouter, Depends, Request, Response
 
 from features import __version__
-from features.auth_client import AuthServiceClient
 from features.config import gateway_settings
 from features.registry import ServiceRegistry
 
-from ..dependencies import get_auth_client, get_proxy_client, get_registry
+from ..dependencies import get_proxy_client, get_registry
 from ..models.health_model import (
     DependencyStatus,
     LivenessResponse,
@@ -54,34 +53,12 @@ async def live() -> LivenessResponse:
     return LivenessResponse(version=__version__)
 
 
-async def _readiness(
-    auth: AuthServiceClient, registry: ServiceRegistry
-) -> ReadinessResponse:
+async def _readiness(registry: ServiceRegistry) -> ReadinessResponse:
     deps: list[DependencyStatus] = []
-
-    # ── auth-service ────────────────────────────────────────────────────────
-    started = time.perf_counter()
-    auth_ok = await auth.ping()
-    auth_latency = (time.perf_counter() - started) * 1000
-    deps.append(
-        DependencyStatus(
-            name="auth-service",
-            status="ok" if auth_ok else "degraded",
-            detail=(
-                f"reachable at {auth.base_url}"
-                if auth_ok
-                else f"unreachable at {auth.base_url} — sign-in and sign-up will "
-                "fail, but requests with a valid token are unaffected "
-                "(tokens are verified locally)"
-            ),
-            latency_ms=round(auth_latency, 1),
-        )
-    )
 
     # ── route table ─────────────────────────────────────────────────────────
     # Configuration, not connectivity — whether the upstreams are actually up
-    # is /health/upstreams, deliberately not part of readiness (see the module
-    # docstring).
+    # is /health/upstreams, deliberately not part of readiness (see above).
     deps.append(
         DependencyStatus(
             name="route_table",
@@ -128,9 +105,8 @@ async def _readiness(
         )
 
     # "degraded" never makes the gateway unready: every degraded state above
-    # still leaves it able to serve authenticated traffic, which is the bulk of
-    # what it does. Only an outright "unavailable" would, and nothing here
-    # currently produces one.
+    # still leaves it able to route authenticated traffic, which is the bulk of
+    # what it does.
     overall = "unavailable" if any(d.status == "unavailable" for d in deps) else "ok"
     return ReadinessResponse(status=overall, version=__version__, dependencies=deps)
 
@@ -138,10 +114,9 @@ async def _readiness(
 @router.get("", response_model=ReadinessResponse, summary="Readiness probe")
 async def health(
     response: Response,
-    auth: AuthServiceClient = Depends(get_auth_client),
     registry: ServiceRegistry = Depends(get_registry),
 ) -> ReadinessResponse:
-    result = await _readiness(auth, registry)
+    result = await _readiness(registry)
     if result.status != "ok":
         response.status_code = 503
     return result
@@ -150,10 +125,9 @@ async def health(
 @router.get("/ready", response_model=ReadinessResponse, summary="Readiness probe")
 async def ready(
     response: Response,
-    auth: AuthServiceClient = Depends(get_auth_client),
     registry: ServiceRegistry = Depends(get_registry),
 ) -> ReadinessResponse:
-    result = await _readiness(auth, registry)
+    result = await _readiness(registry)
     if result.status != "ok":
         response.status_code = 503
     return result
@@ -173,16 +147,20 @@ async def upstreams(
     whole platform. Use /health/ready for that.
 
     Each service is asked for its own /health/live, which every service in this
-    platform serves without a credential.
+    platform serves without a credential. The probe goes to the upstream's
+    ORIGIN, not its configured base_url: a base_url may carry a path
+    (auth-service is routed as ".../auth"), and /health/live lives at the root
+    of the service rather than under that path.
     """
     proxy_client = get_proxy_client(request)
 
     async def probe(route) -> UpstreamStatus:
+        origin = httpx.URL(route.base_url)
+        health_url = str(origin.copy_with(path="/health/live", query=None))
+
         started = time.perf_counter()
         try:
-            response = await proxy_client.client.get(
-                f"{route.base_url}/health/live", timeout=5.0
-            )
+            response = await proxy_client.client.get(health_url, timeout=5.0)
             latency = (time.perf_counter() - started) * 1000
             return UpstreamStatus(
                 name=route.name,

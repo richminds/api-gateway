@@ -131,7 +131,7 @@ async def routes(registry: ServiceRegistry = Depends(get_registry)) -> list[Rout
 
 
 @router.get("/config", response_model=ConfigResponse, summary="Resolved configuration")
-async def config(registry: ServiceRegistry = Depends(get_registry)) -> ConfigResponse:
+async def config(request: Request, registry: ServiceRegistry = Depends(get_registry)) -> ConfigResponse:
     """What this instance actually resolved from its environment.
 
     Secrets are never included — not the JWT secret, not the Mongo URI.
@@ -144,7 +144,7 @@ async def config(registry: ServiceRegistry = Depends(get_registry)) -> ConfigRes
         version=__version__,
         environment=service_settings.environment,
         auth_enabled=s.auth_enabled,
-        auth_service_url=s.auth_service_url,
+        public_paths=request.app.state.access_policy.describe(),
         jwt_issuer=s.jwt_issuer,
         jwt_audience=s.jwt_audience,
         jwt_secret_is_default=s.jwt_secret_is_default,

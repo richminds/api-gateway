@@ -121,7 +121,7 @@ def test_usage_snapshot_reports_the_window():
 # Enforcement through the gateway
 # ---------------------------------------------------------------------------
 
-def test_over_budget_requests_get_429(client, user_token, fake_upstream):
+def test_over_budget_requests_get_429(client, user_token, upstreams):
     client.app.state.rate_limiter._limits["user"] = 3
 
     for _ in range(3):
@@ -132,7 +132,7 @@ def test_over_budget_requests_get_429(client, user_token, fake_upstream):
     assert blocked.json()["error"]["code"] == "rate_limit_exceeded"
     assert blocked.json()["error"]["scope"] == "user"
     # Rejected at the edge — the upstream was protected, which is the point.
-    assert len(fake_upstream.requests) == 3
+    assert len(upstreams.requests) == 3
 
 
 def test_429_carries_retry_after_and_limit_headers(client, user_token):

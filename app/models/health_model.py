@@ -114,7 +114,10 @@ class ConfigResponse(BaseModel):
     version: str = ""
     environment: str = ""
     auth_enabled: bool = True
-    auth_service_url: str = ""
+    public_paths: list[str] = Field(default_factory=list)
+    """The paths reachable without a token, as configured. Worth having on the
+    same page as everything else: "why is this endpoint 401ing" and "why is
+    this endpoint NOT 401ing" are both answered here."""
     jwt_issuer: str = ""
     jwt_audience: str = ""
     jwt_secret_is_default: bool = False

@@ -9,7 +9,7 @@ secret the gateway verifies against.
     python scripts/mint_token.py --expires-in -1     # an already-expired one
 
     TOKEN=$(python scripts/mint_token.py)
-    curl -H "Authorization: Bearer $TOKEN" localhost:8000/auth/whoami
+    curl -H "Authorization: Bearer $TOKEN" localhost:8000/api/llm/v1/models
 
 This is a development tool, and it only works where the gateway's secret is
 also yours to hold. That is the point: if you can mint a token for any user,

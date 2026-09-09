@@ -26,9 +26,14 @@ Or, when a token is already held (a browser passing one to its backend)::
 
     gw = GatewayClient("https://api.example.com", token=existing_token)
 
-Nothing here talks to auth-service — only the gateway does. That is the whole
-architecture, and it means an application integrating with this SDK needs
-exactly one URL and one credential.
+Nothing here talks to auth-service directly — every call goes to the gateway,
+which routes it. That is the whole architecture, and it means an application
+integrating with this SDK needs exactly one URL and one credential.
+
+``auth_prefix`` is where the gateway routes auth-service (``GATEWAY_ROUTES``).
+It defaults to ``/auth``, matching the gateway's own default, and is a
+constructor argument rather than a constant because the prefix is a deployment
+choice — the SDK should follow it, not dictate it.
 """
 from __future__ import annotations
 
@@ -112,9 +117,11 @@ class GatewayClient:
         base_url: str,
         token: str = "",
         timeout: float = DEFAULT_TIMEOUT,
+        auth_prefix: str = "/auth",
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.auth_prefix = auth_prefix.rstrip("/")
         self.session = Session(access_token=token)
         self._client = client or httpx.AsyncClient(
             base_url=self.base_url, timeout=timeout
@@ -148,7 +155,9 @@ class GatewayClient:
             payload["account_id"] = account_id
         if org_id:
             payload["org_id"] = org_id
-        body = await self._request("POST", "/auth/register", json=payload, auth=False)
+        body = await self._request(
+            "POST", f"{self.auth_prefix}/register", json=payload, auth=False
+        )
         return self._adopt(body)
 
     async def login(
@@ -164,7 +173,9 @@ class GatewayClient:
         if account_id:
             payload["account_id"] = account_id
         self._credentials = (email, password, account_id)
-        body = await self._request("POST", "/auth/login", json=payload, auth=False)
+        body = await self._request(
+            "POST", f"{self.auth_prefix}/login", json=payload, auth=False
+        )
         return self._adopt(body)
 
     async def logout(self) -> None:
@@ -172,24 +183,19 @@ class GatewayClient:
         the caller asked to be logged out, and keeping a token they believe is
         gone is the worse outcome."""
         try:
-            await self._request("POST", "/auth/logout")
+            await self._request("POST", f"{self.auth_prefix}/logout")
         finally:
             self.session = Session()
             self._credentials = None
 
-    async def whoami(self) -> dict:
-        """The claims the gateway reads from the current token. No round trip
-        to auth-service, so it is cheap enough to call freely."""
-        return await self._request("GET", "/auth/whoami")
-
     async def me(self) -> dict:
-        """The stored profile, which may be newer than the token's claims."""
-        return await self._request("GET", "/auth/me")
+        """The signed-in user's profile, from auth-service via the gateway."""
+        return await self._request("GET", f"{self.auth_prefix}/me")
 
     async def select_account(self, account_id: str) -> Session:
         """Switch to another of this user's app accounts; re-issues the token."""
         body = await self._request(
-            "POST", "/auth/me/account", json={"account_id": account_id}
+            "POST", f"{self.auth_prefix}/me/account", json={"account_id": account_id}
         )
         return self._adopt(body)
 
