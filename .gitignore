@@ -1,0 +1,38 @@
+# Secrets — never commit.
+# Broad by design: any .env variant is ignored, and .env.example is explicitly
+# re-included so the template stays tracked. Real secrets/connection strings
+# live only in .env (untracked) or the deployment's secret store — never in source.
+.env
+.env.*
+**/.env
+**/.env.*
+*.env.local
+*.creds
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+
+# Runtime artefacts
+data/
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,30 @@
+# Local run of the API gateway container.
+#
+#   docker compose up --build
+#   curl localhost:8000/health
+#
+# Reads secrets from .env (never committed). The gateway is a front door — it
+# needs the downstream services to be reachable at the URLs in GATEWAY_ROUTES
+# and GATEWAY_AUTH_SERVICE_URL. On Docker Desktop those are most easily
+# reached as host.docker.internal, which is why it is mapped below for Linux
+# hosts too (where it is not built in).
+services:
+  api-gateway:
+    build: .
+    image: api-gateway:latest
+    container_name: api-gateway
+    ports:
+      - "${APIGW_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      APIGW_PORT: 8000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

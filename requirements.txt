@@ -1,0 +1,21 @@
+# ── HTTP service ─────────────────────────────────────────────────────────────
+fastapi>=0.111
+uvicorn[standard]>=0.30
+pydantic>=2.7
+pydantic-settings>=2.3
+python-dotenv>=1.0
+
+# ── Upstream calls (auth-service client + the reverse proxy itself) ──────────
+# httpx is load-bearing here in a way it isn't in the sibling services: every
+# proxied request is an httpx stream, so the connection-pool settings in
+# features/proxy.py are a capacity knob, not a detail.
+httpx>=0.27
+
+# ── JWT verification (HS256, same secret auth-service signs with) ────────────
+PyJWT>=2.8
+
+# ── Persistence (usage counters + the revoked-token set) ─────────────────────
+# Optional at runtime: with no GATEWAY_MONGO_URI the gateway keeps both
+# in-process (see features/usage.py and features/revocation.py).
+motor>=3.3
+pymongo>=4.6
