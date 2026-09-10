@@ -6,6 +6,10 @@
     "GATEWAY_INTROSPECTION_URL": "https://auth-service-zhx8.vercel.app/auth/me",
     "GATEWAY_INTROSPECTION_CACHE_TTL_SECONDS": "60",
     "GATEWAY_INTROSPECTION_STALE_GRACE_SECONDS": "300",
-    "APIGW_CORS_ORIGIN_REGEX": "^https://(account-management|knowledge-ingest-ui)[a-z0-9-]*\\.vercel\\.app$"
+    "APIGW_CORS_ORIGIN_REGEX": "^https://(account-management|knowledge-ingest-ui)[a-z0-9-]*\\.vercel\\.app$",
+    "GATEWAY_MONGO_DB_NAME": "api_gateway",
+    "GATEWAY_USAGE_COLLECTION": "gateway_usage",
+    "GATEWAY_IDENTITY_CACHE_ENABLED": "true",
+    "GATEWAY_IDENTITY_CACHE_COLLECTION": "gateway_identity_cache"
   }
 }

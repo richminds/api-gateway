@@ -454,8 +454,19 @@ string the fake auth-service rejects.
 - **auth-service is now on the critical path.** Every authenticated request
   needs it (modulo the cache), so its availability is the platform's
   availability. Size the TTL and stale grace accordingly.
-- **Set `GATEWAY_MONGO_URI` for more than one replica** if you want usage
-  counters merged across instances. Revocation no longer depends on it.
+- **Set `GATEWAY_MONGO_URI` for more than one replica.** Two things go dormant
+  without it: usage counters stop being merged across instances, and the shared
+  identity cache above never activates, leaving the per-process dict as the
+  whole cache. On Vercel, where a cold start is a fresh process, that is the
+  case it exists to fix — auth-service then sees roughly one `/auth/me` per
+  cold start per token rather than one per TTL for the whole deployment.
+  Revocation no longer depends on it.
+
+  It is deliberately **not** in `vercel.json`, which is committed — a
+  connection string belongs in the project's Environment Variables (Settings →
+  Environment Variables) instead. The non-secret half (`GATEWAY_MONGO_DB_NAME`,
+  the two collection names, `GATEWAY_IDENTITY_CACHE_ENABLED`) is in
+  `vercel.json`, so setting the URI there is the only step left.
 - **Only this service should be publicly reachable.** The whole model assumes
   auth-service, llm-gateway and knowledge-service are on a private network.
 - **`APIGW_TRUST_FORWARDED_FOR` stays false** unless a load balancer you control
