@@ -37,6 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from features import __version__
 from features.access_policy import build_access_policy
 from features.config import gateway_settings
+from features.identity_cache import init_identity_cache
 from features.introspection import TokenIntrospector
 from features.mongo_connection import close_connection
 from features.proxy import ProxyClient
@@ -94,18 +95,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.registry = build_registry()
     app.state.access_policy = build_access_policy()
     app.state.proxy_client = ProxyClient()
-    app.state.introspector = TokenIntrospector()
+    # Built before the introspector, which takes it as its second tier: one
+    # constructed without it would silently run process-local only, and the
+    # symptom (auth-service seeing N times the expected traffic) shows up in
+    # someone else's dashboard rather than here.
+    app.state.identity_cache = await init_identity_cache()
+    app.state.introspector = TokenIntrospector(shared=app.state.identity_cache)
     await app.state.proxy_client.start()
     await app.state.introspector.start()
 
     await init_usage_tracker()
 
     logger.info(
-        "API Gateway ready — auth=%s via %s (cache %.0fs) upstreams=%d public=%d "
-        "storage=%s",
+        "API Gateway ready — auth=%s via %s (cache %.0fs, grace %.0fs, shared=%s) "
+        "upstreams=%d public=%d storage=%s",
         "enforced" if gateway_settings.auth_enabled else "DISABLED",
         gateway_settings.introspection_url or "NOTHING CONFIGURED",
         gateway_settings.introspection_cache_ttl_seconds,
+        gateway_settings.introspection_stale_grace_seconds,
+        "yes" if app.state.identity_cache.enabled else "no",
         len(app.state.registry),
         len(app.state.access_policy),
         "mongodb" if gateway_settings.mongo_uri else "in-memory",

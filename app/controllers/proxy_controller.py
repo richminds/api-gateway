@@ -27,6 +27,7 @@ import logging
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
+from features.config import gateway_settings
 from features.errors import RouteNotFound
 from features.proxy import (
     ProxyClient,
@@ -84,6 +85,12 @@ async def proxy(
         scheme=request.url.scheme,
         host=request.headers.get("host", ""),
         token=token,
+        # auth-service is served the token alone — it is the identity
+        # authority and has no use for claims it issued itself. See
+        # features/proxy.py's module docstring.
+        inject_identity=(
+            route.name not in gateway_settings.parsed_identity_exempt_services()
+        ),
     )
 
     # The request body is read in full rather than streamed through. A streamed

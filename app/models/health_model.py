@@ -126,6 +126,12 @@ class ConfigResponse(BaseModel):
     logged-out token keeps working for at most this long."""
     introspection_stale_grace_seconds: float = 0.0
     introspection_cache_entries: int = 0
+    identity_cache_enabled: bool = False
+    """Whether the cross-replica identity cache (features/identity_cache.py)
+    is backed by MongoDB. False means each replica caches alone, which is
+    correct but multiplies auth-service's traffic by the replica count."""
+    identity_cache_entries: int = 0
+    """Estimated documents in the shared cache; -1 when it cannot be read."""
     rate_limit_enabled: bool = True
     user_rpm: int = 0
     account_rpm: int = 0

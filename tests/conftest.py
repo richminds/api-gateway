@@ -65,7 +65,7 @@ PROFILES: dict[str, dict] = {
     },
     STAFF_TOKEN: {
         "user_id": "staff-1",
-        "email": "staff@portless.io",
+        "email": "staff@example.com",
         "name": "Staff",
         "account_id": "acme",
         "account_ids": ["acme"],

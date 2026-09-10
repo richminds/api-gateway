@@ -130,6 +130,13 @@ async def routes(registry: ServiceRegistry = Depends(get_registry)) -> list[Rout
     ]
 
 
+def _identity_cache(request: Request):
+    """The shared cache, or a disabled stand-in when the lifespan never ran."""
+    from features.identity_cache import IdentityCache
+
+    return getattr(request.app.state, "identity_cache", None) or IdentityCache()
+
+
 @router.get("/config", response_model=ConfigResponse, summary="Resolved configuration")
 async def config(request: Request, registry: ServiceRegistry = Depends(get_registry)) -> ConfigResponse:
     """What this instance actually resolved from its environment.
@@ -150,6 +157,8 @@ async def config(request: Request, registry: ServiceRegistry = Depends(get_regis
         introspection_cache_ttl_seconds=s.introspection_cache_ttl_seconds,
         introspection_stale_grace_seconds=s.introspection_stale_grace_seconds,
         introspection_cache_entries=request.app.state.introspector.cache_size(),
+        identity_cache_enabled=_identity_cache(request).enabled,
+        identity_cache_entries=await _identity_cache(request).size(),
         rate_limit_enabled=s.rate_limit_enabled,
         user_rpm=s.user_rpm,
         account_rpm=s.account_rpm,

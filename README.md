@@ -188,6 +188,41 @@ Rejections are cached too. A 401 is monotonic — a token auth-service rejects
 never becomes valid again — so caching it is safe, and it stops a client looping
 on a dead token from hammering auth-service.
 
+### Two tiers, so replicas do not multiply the load
+
+The cache above is process-local, which on its own is only half a cache: every
+replica warms its own, so with N of them auth-service sees roughly N times the
+traffic the TTL was meant to buy, and a user's first request to each replica
+pays a full round trip. On a serverless host, where a cold start is a fresh
+process, that is most requests.
+
+The second tier is MongoDB — one document per validated token, shared by every
+replica, in `GATEWAY_IDENTITY_CACHE_COLLECTION` (default
+`gateway_identity_cache`). A request checks the local dict, then the shared
+store, then auth-service, populating both on the way back. It needs no TTL of
+its own: it reuses the two settings above, because a second expiry for the same
+answer is a bug waiting to be written.
+
+| Property | How |
+|---|---|
+| Key | SHA-256 of the token. **The raw token is never written** — a collection of bearer tokens is a collection of working sessions |
+| Stored | `user_id` and `account_id` (both indexed), the profile needed to rebuild the identity, or the rejection |
+| Expiry | a MongoDB TTL index on `expires_at`, set to TTL **+** grace — the outer horizon, since an entry past its TTL is exactly what the grace window serves |
+| Freshness | re-checked in code on every read: MongoDB's TTL monitor runs about once a minute, so a document outliving its own expiry is normal |
+| Failure | every error is a cache miss. An unreachable MongoDB means "ask auth-service", which is what would have happened anyway |
+
+Because `user_id` and `account_id` are indexed, every cached session for a user
+or a whole account can be dropped in one call —
+`TokenIntrospector.forget_user()` / `forget_account()` — instead of waiting out
+the TTL when an administrator disables a user or moves them between accounts.
+That is bounded rather than instant: it clears the shared store and the calling
+replica, but a replica already holding the answer keeps serving it until its own
+TTL lapses.
+
+It is inactive without `GATEWAY_MONGO_URI`, and the gateway runs on the local
+tier alone — a supported configuration, not a degraded one. `GET /v1/config`
+reports `identity_cache_enabled` and `identity_cache_entries`.
+
 ### When auth-service cannot be reached
 
 | Situation | Result |
@@ -213,16 +248,15 @@ soon as the cached answer expires. There is no revocation store in this service.
 
 The gateway **replaces** the caller's identity headers with verified ones. This
 is the security-critical part: downstream services trust `X-User-ID` and
-`X-Org-ID`, so if a caller could send them, they could read any tenant's data by
-typing a different value. Stripping is unconditional.
+`X-Account-ID`, so if a caller could send them, they could read any tenant's
+data by typing a different value. Stripping is unconditional.
 
 | Header | From |
 |---|---|
 | `X-User-ID` | the `sub` claim |
 | `X-User-Email`, `X-User-Name` | token claims |
 | `X-Account-ID` | the app account the token is scoped to |
-| `X-Org-ID` | the tenant — what downstream services filter data on |
-| `X-Is-Portless` | platform staff; sent **only** when true |
+| `X-Is-Admin` | `true` — and sent only when true |
 | `X-Authenticated-Via` | `api-gateway` |
 | `X-Request-ID` | the correlation ID |
 | `Authorization` | the original bearer token, forwarded |
@@ -231,6 +265,18 @@ The token is forwarded *as well as* the decomposed claims, deliberately:
 llm-gateway and knowledge-service already validate JWTs themselves and keep
 doing so unchanged. `X-Forwarded-For` is **set**, not appended — the gateway is
 the trust boundary, so a caller cannot forge its own origin.
+
+**auth-service is the one exception**: it is sent `Authorization` and none of
+the claim headers. It is the identity authority — it derives the caller from a
+token it signed itself, and a second, weaker source of truth alongside that can
+only disagree with it. It is still stripped like every other upstream, which is
+the half that matters: a service that is not told who the caller is must also
+not be told a lie by the caller.
+
+Which services are exempt is `GATEWAY_IDENTITY_EXEMPT_SERVICES` (default
+`auth`, naming `GATEWAY_ROUTES` entries — not path prefixes). Anything not on
+that list receives the full set, so a service added to the route table is
+served identity headers by default rather than silently going without them.
 
 ---
 
@@ -302,7 +348,7 @@ Only health and its own observability. Everything else is routed.
 | `GET` | `/v1/routes` | staff | The route table |
 | `GET` | `/v1/config` | staff | Resolved, non-secret configuration |
 
-"staff" means the token's `is_portless` claim — set by auth-service, never by
+"staff" means the token's `is_admin` claim — set by auth-service, never by
 the gateway, which has no user store of its own.
 
 A **down upstream is not an unready gateway**: if llm-gateway is unreachable,
@@ -361,6 +407,7 @@ features/                portable core — no FastAPI import
   registry.py            the route table
   access_policy.py       which paths are public
   introspection.py       validation, delegated to auth-service (cached)
+  identity_cache.py      the cross-replica tier of that cache, in MongoDB
   identity.py            the caller, as auth-service reported them
   proxy.py               forwarding + identity injection
   rate_limiter.py        sliding windows

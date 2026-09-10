@@ -15,6 +15,15 @@ identity. A short-lived cache keyed on the token collapses that to one call
 per token per TTL, which is the difference between auth-service seeing the
 platform's entire request volume and seeing a trickle.
 
+**Two tiers.** The dict in this module is the first: process-local, free to
+read, and warmed independently by every replica — so on its own it multiplies
+auth-service's traffic by the number of replicas rather than dividing it. The
+second is ``features/identity_cache.py``, one MongoDB document per token,
+shared by all of them and expired by a TTL index. A request checks the local
+dict, then the shared store, then auth-service, populating both on the way
+back. The shared tier is optional: with no ``GATEWAY_MONGO_URI`` the local
+one is the whole cache and everything below still holds.
+
 The cost is revocation lag: a logged-out token keeps working until its cache
 entry expires, at most ``GATEWAY_INTROSPECTION_CACHE_TTL_SECONDS``. That is
 the one knob to turn if you want logout to bite faster, and the trade is
@@ -50,6 +59,7 @@ import httpx
 from .config import gateway_settings
 from .errors import AuthenticationError, UpstreamError
 from .identity import CallerIdentity, identity_from_profile
+from .identity_cache import IdentityCache
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +103,7 @@ class TokenIntrospector:
         stale_grace: float | None = None,
         timeout: float | None = None,
         client: httpx.AsyncClient | None = None,
+        shared: IdentityCache | None = None,
     ) -> None:
         s = gateway_settings
         # `url if url is None` rather than `url or ...`: an explicit "" means
@@ -109,6 +120,9 @@ class TokenIntrospector:
         self._owns_client = client is None
         self._cache: dict[str, _Entry] = {}
         self._lock = asyncio.Lock()
+        # The cross-replica tier. None, or a disabled one, is a supported
+        # configuration rather than a degraded one — see the module docstring.
+        self._shared = shared
 
     # ------------------------------------------------------------- lifecycle
 
@@ -146,6 +160,22 @@ class TokenIntrospector:
         now = time.monotonic()
 
         cached = self._cache.get(key)
+        if cached is not None and cached.age(now) < self._cache_ttl:
+            if cached.rejection:
+                raise AuthenticationError(cached.rejection, reason=cached.reason_code)
+            assert cached.identity is not None
+            return cached.identity
+
+        # Nothing usable locally. Another replica may already have asked, so
+        # look there before adding to auth-service's load. A stale local entry
+        # still matters for the grace window below, which is why the shared
+        # answer is adopted only when it is genuinely newer than the local one.
+        shared = await self._read_shared(key, now)
+        if shared is not None and (
+            cached is None or shared.fetched_at > cached.fetched_at
+        ):
+            cached = shared
+            self._cache[key] = shared
         if cached is not None and cached.age(now) < self._cache_ttl:
             if cached.rejection:
                 raise AuthenticationError(cached.rejection, reason=cached.reason_code)
@@ -236,11 +266,44 @@ class TokenIntrospector:
             SERVICE_NAME, f"unexpected status {response.status_code} from {self._url}"
         )
 
+    async def _read_shared(self, key: str, now: float) -> _Entry | None:
+        """The shared store's answer as a local entry, or None.
+
+        The conversion is the point of this method. The shared store records
+        wall-clock time and hands back an *age*; everything in this class
+        reasons in ``time.monotonic()``, which means nothing in another
+        process. Subtracting the age from the current monotonic reading places
+        the entry on this process's timeline, so one set of freshness rules
+        covers both tiers instead of two that can disagree.
+        """
+        if self._shared is None or not self._shared.enabled:
+            return None
+        answer = await self._shared.get(key)
+        if answer is None:
+            return None
+        return _Entry(
+            fetched_at=now - answer.age_seconds,
+            identity=answer.identity,
+            rejection=answer.rejection,
+            reason_code=answer.reason_code,
+        )
+
     async def _store(self, key: str, entry: _Entry) -> None:
         async with self._lock:
             self._cache[key] = entry
             if len(self._cache) > self._PRUNE_THRESHOLD:
                 self._prune()
+
+        # Deliberately outside the lock: this is a database round trip, and
+        # holding an asyncio lock across it would serialise every concurrent
+        # validation in this process behind one write.
+        if self._shared is not None and self._shared.enabled:
+            await self._shared.put(
+                key,
+                identity=entry.identity,
+                rejection=entry.rejection,
+                reason_code=entry.reason_code,
+            )
 
     def _prune(self) -> None:
         """Drop entries past any possible usefulness. Caller holds the lock."""
@@ -251,11 +314,61 @@ class TokenIntrospector:
         }
 
     def invalidate(self, token: str = "") -> None:
-        """Forget one token's cached answer, or all of them."""
+        """Forget one token's cached answer locally, or all of them.
+
+        This process only. ``forget`` reaches the shared tier as well — on a
+        multi-replica deployment, dropping a local entry leaves every other
+        replica still serving the same answer until its own TTL expires.
+        """
         if token:
             self._cache.pop(_cache_key(token), None)
         else:
             self._cache.clear()
+
+    async def forget(self, token: str = "") -> int:
+        """Drop an answer from both tiers. Returns shared documents removed."""
+        self.invalidate(token)
+        if self._shared is None or not self._shared.enabled:
+            return 0
+        if token:
+            return await self._shared.invalidate_token(_cache_key(token))
+        return await self._shared.clear()
+
+    async def forget_user(self, user_id: str) -> int:
+        """Drop every cached session for one user, across replicas.
+
+        What an administrator disabling a user, or moving them to another
+        account, actually wants: otherwise their existing tokens keep
+        resolving to the old answer everywhere until the TTL runs out.
+        """
+        if not user_id:
+            return 0
+        self._drop_local(
+            lambda e: e.identity is not None and e.identity.user_id == user_id
+        )
+        if self._shared is None or not self._shared.enabled:
+            return 0
+        return await self._shared.invalidate_user(user_id)
+
+    async def forget_account(self, account_id: str) -> int:
+        """Drop every cached session scoped to one account, across replicas."""
+        if not account_id:
+            return 0
+        self._drop_local(
+            lambda e: e.identity is not None and e.identity.account_id == account_id
+        )
+        if self._shared is None or not self._shared.enabled:
+            return 0
+        return await self._shared.invalidate_account(account_id)
+
+    def _drop_local(self, matches) -> None:
+        """Remove local entries a predicate selects.
+
+        Cached rejections carry no identity and so never match, which is
+        right: a token auth-service rejected does not become valid again
+        because its owner was edited.
+        """
+        self._cache = {k: e for k, e in self._cache.items() if not matches(e)}
 
 
 def _rejection_message(response: httpx.Response) -> str:

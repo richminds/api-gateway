@@ -17,9 +17,18 @@ caller could send those headers themselves they would be able to read any
 account's data by typing a different value. Stripping is unconditional — not
 "if absent, add", but "remove whatever was there, then set ours".
 
-``x-org-id`` and ``x-is-portless`` are still stripped even though nothing
-sends them any more: a caller must not be able to smuggle in a header that a
-service which has not yet been updated might still honour.
+``x-org-id`` is still stripped even though nothing sends it any more: a
+caller must not be able to smuggle in a header that a service which has not
+yet been updated might still honour.
+
+**Stripping is unconditional; injection is not.** A service named in
+``GATEWAY_IDENTITY_EXEMPT_SERVICES`` — auth-service by default — is sent the
+bearer token and no decomposed claims at all. It is the identity authority:
+it derives the caller from a token it signed itself, and a second, weaker
+source of truth alongside that can only disagree with it. Such a service is
+still stripped first, and that is the half that matters — an upstream that is
+not told who the caller is must also not be told a lie by the caller. Every
+other upstream gets the full set.
 
 Hop-by-hop headers (RFC 7230 §6.1) are dropped in both directions. Forwarding
 ``Connection``, ``Keep-Alive`` or ``Transfer-Encoding`` from one connection
@@ -67,7 +76,6 @@ STRIPPED_REQUEST_HEADERS = frozenset(
         "x-user-name",
         "x-account-id",
         "x-org-id",
-        "x-is-portless",
         "x-is-admin",
         "x-authenticated-via",
         "x-forwarded-for",
@@ -96,6 +104,7 @@ def build_upstream_headers(
     scheme: str = "http",
     host: str = "",
     token: str = "",
+    inject_identity: bool = True,
 ) -> dict[str, str]:
     """The header set to send upstream: caller's headers, sanitised, plus ours.
 
@@ -105,6 +114,10 @@ def build_upstream_headers(
     lets them stay independently runnable and independently testable. The
     injected headers are the convenience layer on top, not a replacement for
     the token.
+
+    ``inject_identity=False`` keeps the token and drops every claim header —
+    see the module docstring for why auth-service is served that way. It does
+    not affect stripping, which has already happened by then.
 
     Every key is lowercased, and that is load-bearing rather than cosmetic. A
     Python dict is case-sensitive but HTTP header names are not, so mixing
@@ -123,21 +136,30 @@ def build_upstream_headers(
     headers["x-request-id"] = request_id
 
     if not identity.is_anonymous:
-        headers["x-user-id"] = identity.user_id
-        headers["x-authenticated-via"] = "api-gateway"
-        if identity.email:
-            headers["x-user-email"] = identity.email
-        if identity.name:
-            headers["x-user-name"] = identity.name
-        if identity.account_id:
-            headers["x-account-id"] = identity.account_id
-        if identity.is_admin:
-            # Only ever sent when true. An "X-Is-Admin: false" header invites a
-            # downstream service to parse the string, and "false" is truthy in
-            # more languages than not.
-            headers["x-is-admin"] = "true"
+        # Goes to every upstream, exempt or not: it is the caller's own
+        # credential, and each service validates it independently.
         if token:
             headers["authorization"] = f"Bearer {token}"
+
+        if inject_identity:
+            headers["x-user-id"] = identity.user_id
+            headers["x-authenticated-via"] = "api-gateway"
+            if identity.email:
+                headers["x-user-email"] = identity.email
+            if identity.name:
+                headers["x-user-name"] = identity.name
+            if identity.account_id:
+                # Omitted rather than sent empty when the user belongs to no
+                # account: "X-Account-ID: " reads downstream as a tenant whose
+                # id is the empty string, not as "named no tenant", and
+                # llm-gateway's request_context middleware draws exactly that
+                # distinction when it groups tracked usage.
+                headers["x-account-id"] = identity.account_id
+            if identity.is_admin:
+                # Only ever sent when true. An "X-Is-Admin: false" header invites a
+                # downstream service to parse the string, and "false" is truthy in
+                # more languages than not.
+                headers["x-is-admin"] = "true"
 
     # Standard proxy provenance, so the upstream can log the real client rather
     # than the gateway's own address. Set (not appended) because the gateway is

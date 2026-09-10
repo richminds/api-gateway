@@ -1,9 +1,9 @@
 """Forwarding: path translation, identity injection, and header hygiene.
 
 The header-spoofing tests are the security-critical ones. Downstream services
-trust ``X-User-ID`` and ``X-Org-ID``, so the gateway must replace whatever the
-caller sent with what the token actually says — not merely fill them in when
-absent.
+trust ``X-User-ID`` and ``X-Account-ID``, so the gateway must replace whatever
+the caller sent with what the token actually says — not merely fill them in
+when absent.
 """
 from __future__ import annotations
 
@@ -83,7 +83,6 @@ def test_verified_identity_is_injected_as_headers(client, user_token):
     assert headers["x-user-id"] == "user-1"
     assert headers["x-user-email"] == "user@example.com"
     assert headers["x-account-id"] == "acme"
-    assert headers["x-account-id"] == "acme"
     assert headers["x-authenticated-via"] == "api-gateway"
 
 
@@ -104,6 +103,58 @@ def test_admin_flag_is_only_sent_when_true(client, fake_auth):
 
     admin = client.get("/api/llm/v1/models", headers=auth_headers("tok-admin"))
     assert seen(admin)["headers"]["x-is-admin"] == "true"
+
+
+# ---------------------------------------------------------------------------
+# Who gets identity headers, and who only gets the token
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("prefix", ["/api/llm", "/api/knowledge"])
+def test_ordinary_services_get_the_token_and_the_identity_headers(
+    client, user_token, prefix
+):
+    """Everything except auth-service is told who the caller is *and* handed
+    the token to verify that independently."""
+    response = client.get(f"{prefix}/v1/models", headers=auth_headers(user_token))
+    headers = seen(response)["headers"]
+    assert headers["authorization"] == f"Bearer {user_token}"
+    assert headers["x-user-id"] == "user-1"
+    assert headers["x-account-id"] == "acme"
+
+
+def test_auth_service_gets_the_token_alone(client, user_token):
+    """It signed the token itself, so it needs no help reading it — and a
+    second source of truth alongside it could only disagree with it."""
+    response = client.get("/auth/me", headers=auth_headers(user_token))
+    headers = seen(response)["headers"]
+    assert headers["authorization"] == f"Bearer {user_token}"
+    for header in (
+        "x-user-id",
+        "x-account-id",
+        "x-user-email",
+        "x-user-name",
+        "x-is-admin",
+        "x-authenticated-via",
+    ):
+        assert header not in headers
+
+
+def test_auth_service_still_has_spoofed_identity_headers_stripped(client, user_token):
+    """Not injecting is not the same as passing through. An upstream that is
+    not told who the caller is must also not be told a lie by the caller."""
+    response = client.get(
+        "/auth/me",
+        headers={
+            **auth_headers(user_token),
+            "X-User-ID": "someone-else",
+            "X-Account-ID": "another-account",
+            "X-Is-Admin": "true",
+        },
+    )
+    headers = seen(response)["headers"]
+    assert "x-user-id" not in headers
+    assert "x-account-id" not in headers
+    assert "x-is-admin" not in headers
 
 
 def test_correlation_id_is_forwarded(client, user_token):
@@ -132,7 +183,6 @@ def test_a_correlation_id_is_minted_when_absent(client, user_token):
         ("X-Account-ID", "another-account-x"),
         ("X-Account-ID", "another-account"),
         ("X-User-Email", "admin@evil.test"),
-        ("X-Is-Portless", "true"),
         ("X-Authenticated-Via", "trust-me"),
     ],
 )

@@ -93,6 +93,17 @@ class GatewaySettings(BaseSettings):
         "knowledge:/api/knowledge:http://localhost:8090"
     )
 
+    # Services that receive the bearer token and NOTHING else — no X-User-ID,
+    # X-Account-ID or any other decomposed claim. auth-service is the identity
+    # authority: it derives the caller from a token it signed itself, so
+    # telling it who the caller is adds nothing and hands it a second, weaker
+    # source of truth that could disagree with the first. Every other upstream
+    # gets the full set, so a service added to GATEWAY_ROUTES is served
+    # identity headers by default rather than silently going without them.
+    #
+    # Names must match the GATEWAY_ROUTES entry names, not the path prefixes.
+    identity_exempt_services: str = "auth"
+
     # ────────────────────────────────────────────────────────── secured or not
     # Which routed paths may be reached WITHOUT a token. Everything else needs
     # a valid token — see features/access_policy.py for the entry syntax and for
@@ -176,14 +187,38 @@ class GatewaySettings(BaseSettings):
     # replica, and they reset on restart. Set it for anything with more than
     # one replica, otherwise each replica reports only its own traffic.
     mongo_uri: str = ""
-    mongo_db_name: str = "portless"
+    mongo_db_name: str = "app"
     usage_collection: str = "gateway_usage"
+
+    # ── shared identity cache (features/identity_cache.py) ──────────────────
+    # Second tier in front of auth-service, shared by every replica. The
+    # in-process cache is per-replica, so with N of them auth-service sees N
+    # times the traffic the TTL was meant to buy; this collapses that back to
+    # one call per token per TTL for the whole deployment.
+    #
+    # No TTL of its own: it reuses GATEWAY_INTROSPECTION_CACHE_TTL_SECONDS and
+    # GATEWAY_INTROSPECTION_STALE_GRACE_SECONDS, because a second, disagreeing
+    # expiry for the same answer is a bug waiting to be written. Documents are
+    # expired by a MongoDB TTL index at TTL + grace — the outer horizon, since
+    # an entry past its TTL is exactly what the grace window serves.
+    #
+    # Inactive with no GATEWAY_MONGO_URI; the in-process tier still works.
+    identity_cache_enabled: bool = True
+    identity_cache_collection: str = "gateway_identity_cache"
 
     # ─────────────────────────────────────────────────────────────────── derived
 
     @property
     def introspection_configured(self) -> bool:
         return bool(self.introspection_url.strip())
+
+    def parsed_identity_exempt_services(self) -> frozenset[str]:
+        """Service names that get the bearer token but no identity headers."""
+        return frozenset(
+            name.strip()
+            for name in self.identity_exempt_services.split(",")
+            if name.strip()
+        )
 
     def parsed_rate_limit_overrides(self) -> dict[str, int]:
         """``{principal: rpm}``. Malformed entries are logged and skipped
