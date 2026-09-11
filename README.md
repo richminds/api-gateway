@@ -14,16 +14,16 @@ hands to auth-service, which answers "who is this?" — having checked the
 signature, the expiry and its own revocation list.
 
 ```
-                        ┌──────────────────────────────────────┐
-   browser / client     │            api-gateway  :8000        │
-   ───────────────────► │                                      │
-   service-to-service   │  authenticate → budget → log → route │
-                        └───┬──────────────┬───────────────┬───┘
-                            │              │               │
-              ┌─────────────┘              │               └──────────────┐
-              ▼                            ▼                              ▼
-      auth-service :8100          llm-gateway :8080         knowledge-service :8090
-        /auth/*                     /api/llm/*                /api/knowledge/*
+                        ┌───────────────────────────────────────────┐
+   browser / client     │             api-gateway  :8000            │
+   ───────────────────► │                                           │
+   service-to-service   │   authenticate → budget → log → route     │
+                        └──┬───────────┬────────────┬───────────┬───┘
+                           │           │            │           │
+           ┌───────────────┘           │            │           └───────────────┐
+           ▼                           ▼            ▼                           ▼
+   auth-service :8100        llm-gateway :8080  knowledge-service :8090   makemerich-backend
+     /auth/*                   /api/llm/*         /api/knowledge/*          /api/makemerich/*
 ```
 
 Every service behind it is private. The gateway is the only thing that reaches
@@ -129,9 +129,10 @@ forwarding, so upstreams keep serving the paths they always did and stay
 independently runnable:
 
 ```
-GET /api/llm/v1/chat        →  llm-gateway        GET /v1/chat
-GET /api/knowledge/v1/query →  knowledge-service  GET /v1/query
-POST /auth/login            →  auth-service       POST /auth/login
+GET /api/llm/v1/chat        →  llm-gateway         GET /v1/chat
+GET /api/knowledge/v1/query →  knowledge-service   GET /v1/query
+GET /api/makemerich/goals   →  makemerich-backend  GET /goals
+POST /auth/login            →  auth-service        POST /auth/login
 ```
 
 The auth entry's `base_url` carries a **path**
