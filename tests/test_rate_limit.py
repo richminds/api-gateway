@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import pytest
 
-from features.rate_limiter import RateLimitExceeded, RateLimiter
+from features.rate_limiter import (
+    AnonymousBudgets,
+    RateLimitExceeded,
+    RateLimiter,
+    parse_anonymous_rpm_overrides,
+)
 
 from .conftest import VALID_TOKEN, auth_headers, register_token
 
@@ -179,3 +184,92 @@ def test_sign_in_traffic_is_limited_by_ip(client):
     assert client.post("/auth/login", json=payload).status_code == 200
     assert client.post("/auth/login", json=payload).status_code == 200
     assert client.post("/auth/login", json=payload).status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# Per-path anonymous budgets (GATEWAY_ANONYMOUS_RPM_OVERRIDES)
+#
+# These exist for an upstream routed as public because it validates its OWN
+# tokens, not because its traffic is unauthenticated — all of it lands in the
+# anonymous dimension. The point of the feature is that such a subtree can be
+# generous while POST /auth/login stays tight, which is what the last test
+# here pins down.
+# ---------------------------------------------------------------------------
+
+def test_a_path_budget_raises_the_anonymous_ceiling_for_that_path_only():
+    limiter = RateLimiter(user_rpm=0, account_rpm=0, anonymous_rpm=2)
+
+    for _ in range(5):
+        limiter.check(ip="1.2.3.4", anonymous_rpm=5)
+
+    # The SAME ip is still on the global ceiling elsewhere, and the five above
+    # already filled the shared window.
+    with pytest.raises(RateLimitExceeded) as exc:
+        limiter.check(ip="1.2.3.4")
+    assert exc.value.scope == "ip"
+    assert exc.value.limit == 2
+
+
+def test_without_a_path_budget_the_global_anonymous_ceiling_applies():
+    limiter = RateLimiter(user_rpm=0, account_rpm=0, anonymous_rpm=2)
+    limiter.check(ip="1.2.3.4")
+    limiter.check(ip="1.2.3.4")
+    with pytest.raises(RateLimitExceeded):
+        limiter.check(ip="1.2.3.4")
+
+
+def test_a_per_principal_override_still_beats_a_path_budget():
+    """The principal override was configured against this caller; the path
+    budget only against the route. The more specific one wins."""
+    limiter = RateLimiter(
+        user_rpm=0, account_rpm=0, anonymous_rpm=2, overrides={"9.9.9.9": 1}
+    )
+    limiter.check(ip="9.9.9.9", anonymous_rpm=500)
+    with pytest.raises(RateLimitExceeded) as exc:
+        limiter.check(ip="9.9.9.9", anonymous_rpm=500)
+    assert exc.value.limit == 1
+
+
+def test_budgets_match_a_subtree_but_respect_the_boundary():
+    budgets = AnonymousBudgets(parse_anonymous_rpm_overrides("/api/makemerich/*=600"))
+    assert budgets.rpm_for("/api/makemerich") == 600
+    assert budgets.rpm_for("/api/makemerich/transactions") == 600
+    assert budgets.rpm_for("/api/makemerich/auth/login") == 600
+    assert budgets.rpm_for("/api/makemerich/") == 600  # trailing slash
+    # The boundary: a sibling path that merely starts with the same characters.
+    assert budgets.rpm_for("/api/makemerichx") is None
+    assert budgets.rpm_for("/auth/login") is None
+
+
+def test_the_longest_matching_path_wins_regardless_of_entry_order():
+    budgets = AnonymousBudgets(
+        parse_anonymous_rpm_overrides("/api/*=100,/api/makemerich/sse/*=5")
+    )
+    assert budgets.rpm_for("/api/makemerich/sse/events") == 5
+    assert budgets.rpm_for("/api/makemerich/transactions") == 100
+
+
+def test_an_exact_entry_never_matches_by_prefix():
+    budgets = AnonymousBudgets(parse_anonymous_rpm_overrides("/api/makemerich=600"))
+    assert budgets.rpm_for("/api/makemerich") == 600
+    assert budgets.rpm_for("/api/makemerich/transactions") is None
+
+
+def test_malformed_entries_are_skipped_not_fatal():
+    """A typo in one budget must not stop the gateway booting — the fallback is
+    the global anonymous ceiling, which is merely stricter."""
+    budgets = AnonymousBudgets(
+        parse_anonymous_rpm_overrides(
+            "no-equals-sign,/api/good/*=600,relative/path=10,/api/bad/*=notanumber"
+        )
+    )
+    assert len(budgets) == 1
+    assert budgets.rpm_for("/api/good/thing") == 600
+
+
+def test_raising_one_subtree_does_not_raise_sign_in():
+    """The whole point: auth-service has no lockout, so POST /auth/login must
+    keep the tight global budget even while a routed app runs generous."""
+    budgets = AnonymousBudgets(parse_anonymous_rpm_overrides("/api/makemerich/*=600"))
+    assert budgets.rpm_for("/api/makemerich/transactions") == 600
+    assert budgets.rpm_for("/auth/login") is None

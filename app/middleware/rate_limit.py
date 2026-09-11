@@ -14,6 +14,11 @@ Unauthenticated sign-in and sign-up traffic is limited by client IP, which is
 the only key that exists before a user does. Whether the IP is believed from a
 header or taken from the socket is a deployment question with a real security
 consequence — see ``APIGW_TRUST_FORWARDED_FOR`` in app/config.py.
+
+That per-IP ceiling can be raised for specific paths via
+``GATEWAY_ANONYMOUS_RPM_OVERRIDES`` — resolved here, per request, because it is
+keyed on the path and this is the only layer that sees both the path and the
+budget. See features/rate_limiter.py for why it exists.
 """
 from __future__ import annotations
 
@@ -58,6 +63,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # rebuilding it per request would reset every window and enforce
         # nothing at all.
         self._limiter = limiter or RateLimiter()
+        # Parsed once at startup, like the limiter itself — this runs in front
+        # of every request and re-parsing an env var per call would be pure
+        # waste.
+        self._anonymous_budgets = gateway_settings.parsed_anonymous_rpm_overrides()
 
     @property
     def limiter(self) -> RateLimiter:
@@ -79,6 +88,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 user_id=user_id,
                 account_id=account_id,
                 ip=client_ip(request),
+                # Only consulted for the IP dimension, which is only reached
+                # when the caller is anonymous — an authenticated request is
+                # budgeted on its user and account instead.
+                anonymous_rpm=self._anonymous_budgets.rpm_for(request.url.path),
             )
         except RateLimitExceeded as exc:
             # Warning rather than error: being over budget is the system

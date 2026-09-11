@@ -159,6 +159,23 @@ class GatewaySettings(BaseSettings):
     by definition there is no user yet, and it is the one that makes password
     guessing expensive. Kept low for that reason."""
 
+    anonymous_rpm_overrides: str = ""
+    """Per-PATH anonymous ceilings, comma-separated ``path=rpm``::
+
+        GATEWAY_ANONYMOUS_RPM_OVERRIDES=/api/makemerich/*=600
+
+    The escape hatch for an upstream routed as public because it validates its
+    own tokens rather than because its traffic is unauthenticated. All of that
+    traffic counts against the anonymous (per-IP) budget, and ``anonymous_rpm``
+    is sized to make password guessing expensive — far too low for an
+    application's normal load.
+
+    Raising ``anonymous_rpm`` instead would be the wrong fix: auth-service has
+    no lockout of its own, so that budget is the ONLY barrier in front of
+    POST /auth/login. This keeps sign-in tight while one subtree is generous.
+    A trailing ``*`` makes an entry cover a subtree; longest path wins. See
+    features/rate_limiter.py::parse_anonymous_rpm_overrides."""
+
     rate_limit_overrides: str = ""
     """Per-principal exceptions, comma-separated ``key=rpm``, where key is a
     user_id or an account_id::
@@ -218,6 +235,14 @@ class GatewaySettings(BaseSettings):
             name.strip()
             for name in self.identity_exempt_services.split(",")
             if name.strip()
+        )
+
+    def parsed_anonymous_rpm_overrides(self):
+        """The per-path anonymous ceilings, longest path first."""
+        from .rate_limiter import AnonymousBudgets, parse_anonymous_rpm_overrides
+
+        return AnonymousBudgets(
+            parse_anonymous_rpm_overrides(self.anonymous_rpm_overrides)
         )
 
     def parsed_rate_limit_overrides(self) -> dict[str, int]:

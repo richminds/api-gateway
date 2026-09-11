@@ -22,6 +22,17 @@ this without a token — is limited per client IP instead. It is the only key
 available before a user exists, and it is what makes password guessing
 expensive.
 
+**That budget is deliberately small, so it needs a per-path escape hatch.**
+Some upstreams are routed as public at the gateway not because their traffic is
+unauthenticated, but because they validate their own tokens and the gateway
+cannot check them (makemerich-backend today). All of their traffic therefore
+lands in the anonymous dimension, where a budget sized to make password
+guessing expensive — 30/min — throttles an ordinary application within a page
+or two. Raising it globally is the wrong fix: auth-service has no lockout of
+its own, so this budget is the only barrier in front of POST /auth/login.
+``GATEWAY_ANONYMOUS_RPM_OVERRIDES`` therefore sets the anonymous ceiling per
+PATH, letting one subtree be generous while sign-in stays tight.
+
 Algorithm: sliding window over the last 60 seconds, per key. Scope is one
 process: with several replicas each enforces its own window, so divide the
 intended global budget by the replica count. A cross-replica limiter would put
@@ -105,6 +116,95 @@ class _Window:
             self.requests.popleft()
 
 
+@dataclass(frozen=True)
+class AnonymousBudget:
+    """One ``GATEWAY_ANONYMOUS_RPM_OVERRIDES`` entry: a path and its ceiling."""
+
+    path: str
+    rpm: int
+    prefix: bool = False
+    """True when the entry ended in "*"."""
+
+    def matches(self, path: str) -> bool:
+        if self.prefix:
+            # "/x/*" covers "/x/anything" and "/x" itself, but not "/xy" —
+            # the same boundary rule the route table and access policy use.
+            return path == self.path or path.startswith(self.path + "/")
+        return path == self.path
+
+
+class AnonymousBudgets:
+    """The parsed per-path anonymous ceilings. Immutable once built."""
+
+    def __init__(self, rules: list[AnonymousBudget]) -> None:
+        # Longest path first, so a specific rule can be layered over a general
+        # one without the order of the env var mattering.
+        self._rules = sorted(rules, key=lambda r: len(r.path), reverse=True)
+
+    def __len__(self) -> int:
+        return len(self._rules)
+
+    def rpm_for(self, path: str) -> int | None:
+        """The ceiling for this path, or None to use the global default."""
+        normalised = path.rstrip("/") or "/"
+        for rule in self._rules:
+            if rule.matches(normalised):
+                return rule.rpm
+        return None
+
+    def describe(self) -> list[str]:
+        return [f"{r.path}{'/*' if r.prefix else ''}={r.rpm}" for r in self._rules]
+
+
+def parse_anonymous_rpm_overrides(raw: str) -> list[AnonymousBudget]:
+    """Parse ``GATEWAY_ANONYMOUS_RPM_OVERRIDES`` — ``path=rpm``, comma-separated.
+
+    Malformed entries are logged and skipped rather than raising, matching
+    GATEWAY_RATE_LIMIT_OVERRIDES: a typo in one budget should not stop the
+    gateway booting. That is the opposite of the route table and the public-path
+    list, where a dropped entry silently breaks routing or auth and a hard
+    failure at startup is the kinder outcome. Here the fallback is the global
+    anonymous budget, which is safe — merely stricter.
+    """
+    rules: list[AnonymousBudget] = []
+
+    for entry in (e.strip() for e in raw.split(",")):
+        if not entry:
+            continue
+
+        path, sep, value = entry.rpartition("=")
+        if not sep:
+            logger.warning(
+                "Ignoring malformed GATEWAY_ANONYMOUS_RPM_OVERRIDES entry %r — "
+                "expected 'path=rpm'",
+                entry,
+            )
+            continue
+
+        path = path.strip()
+        prefix = path.endswith("*")
+        if prefix:
+            path = path[:-1].rstrip("/")
+
+        if not path.startswith("/"):
+            logger.warning(
+                "Ignoring GATEWAY_ANONYMOUS_RPM_OVERRIDES entry %r — a path must "
+                "start with '/' (e.g. '/api/makemerich/*=600')",
+                entry,
+            )
+            continue
+
+        try:
+            rpm = int(value.strip())
+        except ValueError:
+            logger.warning("Ignoring non-numeric anonymous-rpm override %r", entry)
+            continue
+
+        rules.append(AnonymousBudget(path=path, rpm=rpm, prefix=prefix))
+
+    return rules
+
+
 class RateLimiter:
     """Sliding-window limiter over the user / account / IP dimensions.
 
@@ -144,8 +244,19 @@ class RateLimiter:
 
     # -------------------------------------------------------------- checks
 
-    def check(self, user_id: str = "", account_id: str = "", ip: str = "") -> None:
+    def check(
+        self,
+        user_id: str = "",
+        account_id: str = "",
+        ip: str = "",
+        anonymous_rpm: int | None = None,
+    ) -> None:
         """Raise RateLimitExceeded if any supplied dimension is over budget.
+
+        ``anonymous_rpm`` overrides the IP ceiling for THIS request only — the
+        per-path budget resolved by the middleware. A per-principal override
+        naming this exact IP still wins over it, since that one was configured
+        against the caller rather than the path.
 
         Empty dimensions are skipped rather than collapsed into a shared
         bucket: lumping every accountless user under one "" key would let any
@@ -175,6 +286,12 @@ class RateLimiter:
         with self._lock:
             for scope, key in dimensions:
                 limit = self.limit_for(scope, key)
+                if (
+                    scope == SCOPE_IP
+                    and anonymous_rpm is not None
+                    and key not in self._overrides
+                ):
+                    limit = anonymous_rpm
                 if limit <= 0:
                     continue  # this dimension is disabled
 
