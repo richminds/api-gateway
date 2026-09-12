@@ -86,9 +86,20 @@ STRIPPED_REQUEST_HEADERS = frozenset(
 
 # Content-Length is recomputed by httpx from the body it actually sends;
 # passing the original through can contradict it and truncate the request.
+#
+# Accept-Encoding is dropped for a subtler reason. The gateway forwards the
+# DECODED upstream body and strips Content-Encoding (proxy_controller.py), so
+# the upstream must only ever compress with something httpx here can decode —
+# and httpx advertises exactly that when left to set the header itself. Relay
+# the browser's list instead and an upstream behind an edge that speaks
+# brotli (Render does) answers `br`; httpx has no decoder for it, quietly
+# passes the raw bytes through, and the client receives brotli labelled as
+# JSON — rendered as binary garbage in devtools, and `e.filter is not a
+# function` in the app.
 _DROPPED_REQUEST_HEADERS = HOP_BY_HOP_HEADERS | STRIPPED_REQUEST_HEADERS | {
     "content-length",
     "host",  # must name the upstream, not the gateway — httpx sets it
+    "accept-encoding",  # negotiated by httpx, which is what decodes the reply
 }
 
 # Same reasoning on the way back: the response is re-framed onto the client's

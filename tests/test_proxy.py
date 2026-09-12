@@ -263,3 +263,17 @@ def test_errors_carry_the_request_id(client, user_token, upstreams):
         headers={**auth_headers(user_token), "X-Request-ID": "find-me"},
     )
     assert response.json()["error"]["request_id"] == "find-me"
+
+
+def test_the_callers_accept_encoding_is_not_relayed(client, user_token):
+    """The gateway forwards the DECODED body and drops Content-Encoding, so the
+    upstream must only compress with what httpx can decode — which is what
+    httpx advertises when it sets Accept-Encoding itself. Relaying the
+    browser's list let an upstream behind a brotli-speaking edge answer `br`,
+    which httpx passed through undecoded: brotli bytes labelled as JSON."""
+    response = client.get(
+        "/api/llm/v1/models",
+        headers={**auth_headers(user_token), "Accept-Encoding": "gzip, deflate, br, zstd"},
+    )
+    upstream_saw = seen(response)["headers"]
+    assert "br" not in upstream_saw.get("accept-encoding", "")
