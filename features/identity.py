@@ -76,18 +76,33 @@ configured public paths. A sentinel rather than None so call sites can read
 def identity_from_profile(profile: dict[str, Any]) -> CallerIdentity:
     """Build a CallerIdentity from auth-service's ``GET /auth/me`` body.
 
-    Tolerant of fields it does not know about, and of nulls: auth-service
-    returns ``account_id`` as ``null`` for a user who belongs to no account
-    yet, and JSON null must become "" rather than the string "None" — which is
-    what a bare ``str()`` would produce, and which would then be injected
-    downstream as a real-looking account.
+    auth-service reports membership as ``accounts: [{account_id, name,
+    selected}]`` — every application the user may sign in through, with the
+    one this token is scoped to marked ``selected``. That marked entry is the
+    session's account, and what ``X-Account-ID`` must carry; the full list is
+    ``account_ids``. The flat ``account_id`` / ``account_ids`` keys an older
+    auth-service returned are still read as a fallback, so a profile in either
+    shape resolves the same way — reading only the old keys is how every
+    upstream came to receive an EMPTY X-Account-ID for a while.
+
+    Tolerant of fields it does not know about, and of nulls: a user who belongs
+    to no account has an empty ``accounts`` list (or a ``null`` account_id),
+    and that must become "" rather than the string "None" — which is what a
+    bare ``str()`` would produce, and which would then be injected downstream
+    as a real-looking account.
     """
+    accounts = [a for a in (profile.get("accounts") or []) if isinstance(a, dict)]
+    selected = next((a for a in accounts if a.get("selected")), None)
+    account_id = (selected or {}).get("account_id") or profile.get("account_id") or ""
+    account_ids = [str(a.get("account_id")) for a in accounts if a.get("account_id")] or [
+        str(a) for a in (profile.get("account_ids") or [])
+    ]
     return CallerIdentity(
         user_id=str(profile.get("user_id") or ""),
         email=str(profile.get("email") or ""),
         name=str(profile.get("name") or ""),
-        account_id=str(profile.get("account_id") or ""),
-        account_ids=[str(a) for a in (profile.get("account_ids") or [])],
+        account_id=str(account_id),
+        account_ids=account_ids,
         is_admin=bool(profile.get("is_admin", False)),
         raw=profile,
     )
