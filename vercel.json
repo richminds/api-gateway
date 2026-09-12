@@ -1,16 +1,3 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "env": {
-    "GATEWAY_ROUTES": "auth:/auth:https://auth-service-zhx8.vercel.app/auth,llm:/api/llm:https://llm-gateway-theta.vercel.app,knowledge:/api/knowledge:https://knowledge-service-topaz.vercel.app,makemerich:/api/makemerich:https://makemerich-backend.onrender.com",
-    "GATEWAY_PUBLIC_PATHS": "POST:/auth/login,POST:/auth/register,POST:/auth/organizations/register,POST:/auth/forgot-password,POST:/auth/reset-password,POST:/auth/refresh-token,/api/makemerich/*",
-    "GATEWAY_ANONYMOUS_RPM_OVERRIDES": "/api/makemerich/*=600",
-    "GATEWAY_INTROSPECTION_URL": "https://auth-service-zhx8.vercel.app/auth/me",
-    "GATEWAY_INTROSPECTION_CACHE_TTL_SECONDS": "60",
-    "GATEWAY_INTROSPECTION_STALE_GRACE_SECONDS": "300",
-    "APIGW_CORS_ORIGIN_REGEX": "^https://(account-management|knowledge-ingest-ui)[a-z0-9-]*\\.vercel\\.app$",
-    "GATEWAY_MONGO_DB_NAME": "api_gateway",
-    "GATEWAY_USAGE_COLLECTION": "gateway_usage",
-    "GATEWAY_IDENTITY_CACHE_ENABLED": "true",
-    "GATEWAY_IDENTITY_CACHE_COLLECTION": "gateway_identity_cache"
-  }
+  "$schema": "https://openapi.vercel.sh/vercel.json"
 }
